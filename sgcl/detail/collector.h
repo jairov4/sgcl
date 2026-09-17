@@ -342,7 +342,7 @@ namespace sgcl::detail {
         void _mark_childs(void* ptr, const ChildPointers::Vector& offsets) noexcept {
             for (auto offset : offsets) {
                 auto ap = (RawPointer*)ptr + offset;
-                auto p = ap->load(std::memory_order_relaxed);
+                auto p = ap->load(std::memory_order_acquire);
                 if ((size_t)p > 1) {
                     _mark(p);
                 }
@@ -356,7 +356,7 @@ namespace sgcl::detail {
                     auto i = std::countr_zero(flags);
                     auto offset = index * 8 + i;
                     auto ap = (RawPointer*)ptr + offset;
-                    auto p = ap->load(std::memory_order_relaxed);
+                    auto p = ap->load(std::memory_order_acquire);
                     if ((size_t)p > 1) {
                         _mark(p);
                     }
