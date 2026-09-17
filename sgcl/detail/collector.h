@@ -226,7 +226,7 @@ namespace sgcl::detail {
             while(page) {
                 auto next = page->next_registered;
                 if (page->is_used) {
-                    if (page->object_created.load(std::memory_order_relaxed)) {
+                    if (page->object_created.load(std::memory_order_acquire)) {
                         page->object_created.store(false, std::memory_order_relaxed);
                         auto states = page->states();
                         auto flags = page->flags();
