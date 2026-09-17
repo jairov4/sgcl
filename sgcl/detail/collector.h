@@ -193,7 +193,7 @@ namespace sgcl::detail {
         }
 
         void _register_pages(std::atomic<Page*>& pages, Page*& last_page_registered, bool thread_deleted) {
-            auto first_page = pages.load(std::memory_order_relaxed);
+            auto first_page = pages.load(std::memory_order_acquire);
             auto page = first_page;
             while(page != last_page_registered) {
                 page->next_registered = _registered_pages;
