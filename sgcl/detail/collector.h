@@ -600,8 +600,20 @@ namespace sgcl::detail {
                         do {
                             auto countr_zero = std::countr_zero(unreachable);
                             auto index = offset + countr_zero;
+                            auto mask = Page::Flag(1) << countr_zero;
                             auto state = states[index].load(std::memory_order_relaxed);
-                            assert(state < State::Reachable || state > State::UniqueLock);
+                            // A slot can still show Reachable/UniqueLock here despite being computed
+                            // as (registered & ~marked): the state transition that should have kept
+                            // it out of _unreachable_pages (via _mark_updated re-scanning the page)
+                            // can lose a race against this slot's own registration/publication. This
+                            // is defense in depth against destroying a live or mid-construction
+                            // object -- leave it alone and let the next cycle re-evaluate it, instead
+                            // of destroying/reusing memory a mutator may still be initializing.
+                            if (state >= State::Reachable && state <= State::UniqueLock) {
+                                flag.marked |= mask;
+                                unreachable &= unreachable - 1;
+                                continue;
+                            }
                             if (state == State::Unreachable) {
                                 _destroy(page, page->pointer_of(index), true);
                             }
