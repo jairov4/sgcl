@@ -110,6 +110,13 @@ namespace sgcl::detail {
             if constexpr(S == State::UniqueLock
                       || S == State::BadAlloc) {
                 state.store(S, std::memory_order_relaxed);
+                // also flag state_updated: a slot stuck in UniqueLock (mid-construction, e.g. the
+                // slow child-pointer-discovery path) must keep being re-scanned by _mark_updated's
+                // fast (state_updated-gated) path once its page is already on _unreachable_pages --
+                // otherwise its registered-but-not-yet-marked bit can ride along unexamined until
+                // _remove_garbage, which only re-derives (registered & ~marked) without re-checking
+                // whether the state is still protected, and can destroy a half-constructed object.
+                page->state_updated.store(true, std::memory_order_release);
                 page->object_created.store(true, std::memory_order_release);
             } else if constexpr(S == State::Reachable) {
                 state.store(S, std::memory_order_relaxed);
