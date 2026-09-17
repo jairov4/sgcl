@@ -262,11 +262,10 @@ namespace sgcl::detail {
         }
 
         void _update_states() {
-            std::atomic_thread_fence(std::memory_order_acquire);
             auto page = _registered_pages;
             while(page) {
                 page->clear_flags();
-                if (page->state_updated.load(std::memory_order_relaxed)) {
+                if (page->state_updated.load(std::memory_order_acquire)) {
                     page->state_updated.store(false, std::memory_order_relaxed);
                     auto states = page->states();
                     auto flags = page->flags();
