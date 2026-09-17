@@ -606,7 +606,10 @@ namespace sgcl::detail {
                                 _destroy(page, page->pointer_of(index), true);
                             }
                             ++removed;
-                            states[index].store(State::Unused, std::memory_order_relaxed);
+                            // release: publishes this slot's destructor call above (and every
+                            // other write sequenced before it) to whichever thread's fill()
+                            // acquire-reads State::Unused off this page to reuse the memory.
+                            states[index].store(State::Unused, std::memory_order_release);
                             ++page->unused_counter_gc;
                             unreachable &= unreachable - 1;
                         } while(unreachable);
@@ -616,21 +619,26 @@ namespace sgcl::detail {
                 page->unreachable = false;
                 page = page->next_unreachable;
             }
-            std::atomic_thread_fence(std::memory_order_release);
 
             return removed;
         }
 
         void _release_unused_pages() {
-            std::atomic_thread_fence(std::memory_order_acquire);
             Metadata* metadata = nullptr;
             auto page = _registered_pages;
             while(page) {
                 if (page->unused_occur.load(std::memory_order_relaxed)) {
-                    if (!page->on_empty_list.load(std::memory_order_relaxed)) {
+                    // acquire: pairs with a mutator's release store when it takes this page off
+                    // the empty list (object_pool_allocator_base.h's alloc()), so this doesn't
+                    // stay stuck thinking the page is still parked there.
+                    if (!page->on_empty_list.load(std::memory_order_acquire)) {
                         auto count = page->metadata->object_count;
                         auto unused = page->unused_counter_gc;
-                        unused += page->unused_atomic.load(std::memory_order_relaxed);
+                        // acquire: pairs with the release fetch_add/fetch_sub on this counter
+                        // from mutators freeing objects (object_pool_allocator_base.h), so the
+                        // freed count -- and everything sequenced before it, e.g. destructors --
+                        // is visible before this page can be handed back for reuse below.
+                        unused += page->unused_atomic.load(std::memory_order_acquire);
                         unused -= page->unused_counter_mutators;
                         if (unused > count / 2) {
                             page->unused_occur.store(false, std::memory_order_relaxed);
