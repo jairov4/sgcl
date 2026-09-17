@@ -446,12 +446,15 @@ namespace sgcl::detail {
 
         template<bool All>
         void _mark_updated() noexcept {
-            std::atomic_thread_fence(std::memory_order_acquire);
             auto page = All ? _registered_pages : _unreachable_pages;
             while(page) {
                 bool reachable_page = false;
                 [[maybe_unused]] bool unreachable_page = false;
-                if (All || page->state_updated.load(std::memory_order_relaxed)) {
+                // always acquire-load, even when All short-circuits the branch: this is what
+                // synchronizes-with a mutator's state_updated release store so the states[] reads
+                // below observe a freshly-published Reachable transition, not a stale value.
+                auto state_updated = page->state_updated.load(std::memory_order_acquire);
+                if (All || state_updated) {
                     auto states = page->states();
                     auto flags = page->flags();
                     auto count = page->flags_count();
