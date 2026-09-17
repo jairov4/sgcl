@@ -323,12 +323,12 @@ namespace sgcl::detail {
                 if (!thread->is_deleted.load(std::memory_order_acquire)) {
                     auto& allocator = *thread->stack_roots_allocator;
                     for (size_t i = 0; i < std::size(allocator.is_used); ++i) {
-                        auto used = allocator.is_used[i].load(std::memory_order_relaxed);
+                        auto used = allocator.is_used[i].load(std::memory_order_acquire);
                         if (used) {
                             auto first = i * (StackPointerAllocator::PageSize / sizeof(RawPointer));
                             auto last = first + (StackPointerAllocator::PageSize / sizeof(RawPointer));
                             for (size_t index = first; index < last; ++index) {
-                                auto p = allocator.data[index].load(std::memory_order_relaxed);
+                                auto p = allocator.data[index].load(std::memory_order_acquire);
                                 if (p) {
                                     _mark(p);
                                 }
