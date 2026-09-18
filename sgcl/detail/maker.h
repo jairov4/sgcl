@@ -25,7 +25,10 @@ namespace sgcl::detail {
 
         template<class T, class ...A>
         static void _construct_and_register(void* p, A&&... a) {
-            Page::set_state<State::UniqueLock>(p);
+            // Constructing (not UniqueLock) while the constructor runs: a store of `p` into a
+            // tracked pointer from inside the constructor must not hand the object over to the
+            // collector yet, see Page::set_state<State::Reachable>.
+            Page::set_state<State::Constructing>(p);
             try {
                 _construct<T>(p, std::forward<A>(a)...);
             }
@@ -33,6 +36,7 @@ namespace sgcl::detail {
                 Page::set_state<State::BadAlloc>(p);
                 throw;
             }
+            Page::set_state<State::UniqueLock>(p);
         }
     };
 
