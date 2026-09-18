@@ -645,7 +645,14 @@ namespace sgcl {
                             *dst = std::move(*src);
                         }
                     }
-                    _destruct(ptr + pos, ptr + pos + offset);
+                    // Only [pos, s) held live elements before this shift (all of them were
+                    // moved out above, to either a move-constructed new slot or a move-assigned
+                    // old slot). When offset > s - pos (inserting more new elements than the
+                    // count of old elements at/after pos), [pos, pos + offset) reaches past the
+                    // old size into never-constructed memory; destructing that tail past `s`
+                    // still decremented *_size for slots that were never live, undercounting the
+                    // vector's size by (offset - (s - pos)) after every such insert.
+                    _destruct(ptr + pos, ptr + pos + std::min<size_t>(offset, s - pos));
                 } else {
                     _resize(s + offset, pos, offset);
                 }
