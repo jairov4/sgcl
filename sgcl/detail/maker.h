@@ -25,7 +25,10 @@ namespace sgcl::detail {
 
         template<class T, class ...A>
         static void _construct_and_register(void* p, A&&... a) {
-            Page::set_state<State::UniqueLock>(p);
+            // Constructing (not UniqueLock) while the constructor runs: a store of `p` into a
+            // tracked pointer from inside the constructor must not hand the object over to the
+            // collector yet, see Page::set_state<State::Reachable>.
+            Page::set_state<State::Constructing>(p);
             try {
                 _construct<T>(p, std::forward<A>(a)...);
             }
@@ -33,6 +36,7 @@ namespace sgcl::detail {
                 Page::set_state<State::BadAlloc>(p);
                 throw;
             }
+            Page::set_state<State::UniqueLock>(p);
         }
     };
 
@@ -46,15 +50,15 @@ namespace sgcl::detail {
             if constexpr(Info::MayContainTracked) {
                 auto& thread = current_thread();
                 auto range_guard = thread.use_alloc_range({(uintptr_t)(p), sizeof(T)});
-                if (!Info::child_pointers.final.load(std::memory_order_acquire)) {
+                if (!Info::child_pointers().final.load(std::memory_order_acquire)) {
                     auto count = sizeof(Type) / sizeof(RawPointer);
                     auto mem = (RawPointer*)p;
                     for (int i = 0; i < count; ++i) {
                         mem[i].store((void*)size_t(1), std::memory_order_relaxed);
                     }
-                    auto range_guard = thread.use_child_pointers({(uintptr_t)p, &Info::child_pointers.map});
+                    auto range_guard = thread.use_child_pointers({(uintptr_t)p, &Info::child_pointers().map});
                     _construct<Type>(p, std::forward<A>(a)...);
-                    Info::child_pointers.final.store(true, std::memory_order_release);
+                    Info::child_pointers().final.store(true, std::memory_order_release);
                 } else {
                     _construct<Type>(p, std::forward<A>(a)...);
                 }
@@ -90,11 +94,11 @@ namespace sgcl::detail {
             auto mem = allocator.alloc();
             if constexpr(Info::MayContainTracked) {
                 auto range_guard = thread.use_alloc_range({(uintptr_t)(mem), sizeof(T)});
-                if (!Info::child_pointers.final.load(std::memory_order_acquire)) {
+                if (!Info::child_pointers().final.load(std::memory_order_acquire)) {
                     std::fill_n((size_t*)mem, sizeof(T) / sizeof(size_t), size_t(1));
-                    auto child_guard = thread.use_child_pointers({(uintptr_t)mem, &Info::child_pointers.map});
+                    auto child_guard = thread.use_child_pointers({(uintptr_t)mem, &Info::child_pointers().map});
                     _construct_and_register<Type>(mem, std::forward<A>(a)...);
-                    Info::child_pointers.final.store(true, std::memory_order_release);
+                    Info::child_pointers().final.store(true, std::memory_order_release);
                 } else {
                     std::memset(mem, 0, sizeof(T));
                     _construct_and_register<Type>(mem, std::forward<A>(a)...);
@@ -245,13 +249,13 @@ namespace sgcl::detail {
                 int offset;
                 auto& thread = current_thread();
                 auto range_guard = thread.use_alloc_range({(uintptr_t)(array.data), sizeof(Type) * array.capacity});
-                if (array.size && !Info::child_pointers.final.load(std::memory_order_acquire)) {
+                if (array.size && !Info::child_pointers().final.load(std::memory_order_acquire)) {
                     std::fill_n((size_t*)array.data, sizeof(Type) / sizeof(size_t), size_t(1));
                     std::memset((void*)((Type*)array.data + 1), 0, sizeof(Type) * (array.capacity - 1));
                     array.metadata.store(&Info::array_metadata(), std::memory_order_release);
-                    auto child_guard = thread.use_child_pointers({(uintptr_t)array.data, &Info::child_pointers.map});
+                    auto child_guard = thread.use_child_pointers({(uintptr_t)array.data, &Info::child_pointers().map});
                     _init((Type*)array.data, 0, 1, std::forward<A>(a)...);
-                    Info::child_pointers.final.store(true, std::memory_order_release);
+                    Info::child_pointers().final.store(true, std::memory_order_release);
                     offset = 1;
                 } else {
                     std::memset(array.data, 0, sizeof(Type) * array.capacity);

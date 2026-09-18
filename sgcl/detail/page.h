@@ -107,12 +107,32 @@ namespace sgcl::detail {
             auto page = Page::page_of(p);
             auto index = page->index_of(p);
             auto &state = page->states()[index];
-            if constexpr(S == State::UniqueLock
+            if constexpr(S == State::Constructing
+                      || S == State::UniqueLock
                       || S == State::BadAlloc) {
                 state.store(S, std::memory_order_relaxed);
+                // also flag state_updated: a slot stuck in Constructing/UniqueLock (mid-construction,
+                // e.g. the slow child-pointer-discovery path) must keep being re-scanned by
+                // _mark_updated's fast (state_updated-gated) path once its page is already on
+                // _unreachable_pages -- otherwise its registered-but-not-yet-marked bit can ride along
+                // unexamined until _remove_garbage, which only re-derives (registered & ~marked)
+                // without re-checking whether the state is still protected, and can destroy a
+                // half-constructed object.
+                page->state_updated.store(true, std::memory_order_release);
                 page->object_created.store(true, std::memory_order_release);
             } else if constexpr(S == State::Reachable) {
-                state.store(S, std::memory_order_relaxed);
+                // A store of this pointer into a tracked pointer while its constructor is still
+                // running (the constructor aliasing `this` into a child, e.g. a back-reference) is
+                // not an ownership handover: the object is still only owned by the unique_ptr that
+                // Maker::_make will return, which is not a GC root. Reachable is transient (the
+                // next cycle's _update_states demotes it to Used), so downgrading Constructing
+                // here would leave the still-under-construction object with no protection at
+                // all, and the collector would destroy it -- and recycle its slot -- out from
+                // under the running constructor. Only UniqueLock (constructor finished, still
+                // owned by a unique_ptr) is handed over by a store.
+                if (state.load(std::memory_order_relaxed) != State::Constructing) {
+                    state.store(S, std::memory_order_relaxed);
+                }
                 page->state_updated.store(true, std::memory_order_release);
             } else {
                 state.store(S, std::memory_order_release);

@@ -193,7 +193,7 @@ namespace sgcl::detail {
         }
 
         void _register_pages(std::atomic<Page*>& pages, Page*& last_page_registered, bool thread_deleted) {
-            auto first_page = pages.load(std::memory_order_relaxed);
+            auto first_page = pages.load(std::memory_order_acquire);
             auto page = first_page;
             while(page != last_page_registered) {
                 page->next_registered = _registered_pages;
@@ -226,7 +226,7 @@ namespace sgcl::detail {
             while(page) {
                 auto next = page->next_registered;
                 if (page->is_used) {
-                    if (page->object_created.load(std::memory_order_relaxed)) {
+                    if (page->object_created.load(std::memory_order_acquire)) {
                         page->object_created.store(false, std::memory_order_relaxed);
                         auto states = page->states();
                         auto flags = page->flags();
@@ -262,11 +262,10 @@ namespace sgcl::detail {
         }
 
         void _update_states() {
-            std::atomic_thread_fence(std::memory_order_acquire);
             auto page = _registered_pages;
             while(page) {
                 page->clear_flags();
-                if (page->state_updated.load(std::memory_order_relaxed)) {
+                if (page->state_updated.load(std::memory_order_acquire)) {
                     page->state_updated.store(false, std::memory_order_relaxed);
                     auto states = page->states();
                     auto flags = page->flags();
@@ -323,12 +322,12 @@ namespace sgcl::detail {
                 if (!thread->is_deleted.load(std::memory_order_acquire)) {
                     auto& allocator = *thread->stack_roots_allocator;
                     for (size_t i = 0; i < std::size(allocator.is_used); ++i) {
-                        auto used = allocator.is_used[i].load(std::memory_order_relaxed);
+                        auto used = allocator.is_used[i].load(std::memory_order_acquire);
                         if (used) {
                             auto first = i * (StackPointerAllocator::PageSize / sizeof(RawPointer));
                             auto last = first + (StackPointerAllocator::PageSize / sizeof(RawPointer));
                             for (size_t index = first; index < last; ++index) {
-                                auto p = allocator.data[index].load(std::memory_order_relaxed);
+                                auto p = allocator.data[index].load(std::memory_order_acquire);
                                 if (p) {
                                     _mark(p);
                                 }
@@ -343,7 +342,7 @@ namespace sgcl::detail {
         void _mark_childs(void* ptr, const ChildPointers::Vector& offsets) noexcept {
             for (auto offset : offsets) {
                 auto ap = (RawPointer*)ptr + offset;
-                auto p = ap->load(std::memory_order_relaxed);
+                auto p = ap->load(std::memory_order_acquire);
                 if ((size_t)p > 1) {
                     _mark(p);
                 }
@@ -357,7 +356,7 @@ namespace sgcl::detail {
                     auto i = std::countr_zero(flags);
                     auto offset = index * 8 + i;
                     auto ap = (RawPointer*)ptr + offset;
-                    auto p = ap->load(std::memory_order_relaxed);
+                    auto p = ap->load(std::memory_order_acquire);
                     if ((size_t)p > 1) {
                         _mark(p);
                     }
@@ -447,12 +446,15 @@ namespace sgcl::detail {
 
         template<bool All>
         void _mark_updated() noexcept {
-            std::atomic_thread_fence(std::memory_order_acquire);
             auto page = All ? _registered_pages : _unreachable_pages;
             while(page) {
                 bool reachable_page = false;
                 [[maybe_unused]] bool unreachable_page = false;
-                if (All || page->state_updated.load(std::memory_order_relaxed)) {
+                // always acquire-load, even when All short-circuits the branch: this is what
+                // synchronizes-with a mutator's state_updated release store so the states[] reads
+                // below observe a freshly-published Reachable transition, not a stale value.
+                auto state_updated = page->state_updated.load(std::memory_order_acquire);
+                if (All || state_updated) {
                     auto states = page->states();
                     auto flags = page->flags();
                     auto count = page->flags_count();
@@ -598,13 +600,29 @@ namespace sgcl::detail {
                         do {
                             auto countr_zero = std::countr_zero(unreachable);
                             auto index = offset + countr_zero;
+                            auto mask = Page::Flag(1) << countr_zero;
                             auto state = states[index].load(std::memory_order_relaxed);
-                            assert(state < State::Reachable || state > State::UniqueLock);
+                            // A slot can still show Reachable/UniqueLock/Constructing here despite
+                            // being computed as (registered & ~marked): the state transition that
+                            // should have kept it out of _unreachable_pages (via _mark_updated
+                            // re-scanning the page) can lose a race against this slot's own
+                            // registration/publication. This is defense in depth against destroying a
+                            // live or mid-construction object -- leave it alone and let the next cycle
+                            // re-evaluate it, instead of destroying/reusing memory a mutator may still
+                            // be initializing.
+                            if (state & State::ReachableMask) {
+                                flag.marked |= mask;
+                                unreachable &= unreachable - 1;
+                                continue;
+                            }
                             if (state == State::Unreachable) {
                                 _destroy(page, page->pointer_of(index), true);
                             }
                             ++removed;
-                            states[index].store(State::Unused, std::memory_order_relaxed);
+                            // release: publishes this slot's destructor call above (and every
+                            // other write sequenced before it) to whichever thread's fill()
+                            // acquire-reads State::Unused off this page to reuse the memory.
+                            states[index].store(State::Unused, std::memory_order_release);
                             ++page->unused_counter_gc;
                             unreachable &= unreachable - 1;
                         } while(unreachable);
@@ -614,21 +632,26 @@ namespace sgcl::detail {
                 page->unreachable = false;
                 page = page->next_unreachable;
             }
-            std::atomic_thread_fence(std::memory_order_release);
 
             return removed;
         }
 
         void _release_unused_pages() {
-            std::atomic_thread_fence(std::memory_order_acquire);
             Metadata* metadata = nullptr;
             auto page = _registered_pages;
             while(page) {
                 if (page->unused_occur.load(std::memory_order_relaxed)) {
-                    if (!page->on_empty_list.load(std::memory_order_relaxed)) {
+                    // acquire: pairs with a mutator's release store when it takes this page off
+                    // the empty list (object_pool_allocator_base.h's alloc()), so this doesn't
+                    // stay stuck thinking the page is still parked there.
+                    if (!page->on_empty_list.load(std::memory_order_acquire)) {
                         auto count = page->metadata->object_count;
                         auto unused = page->unused_counter_gc;
-                        unused += page->unused_atomic.load(std::memory_order_relaxed);
+                        // acquire: pairs with the release fetch_add/fetch_sub on this counter
+                        // from mutators freeing objects (object_pool_allocator_base.h), so the
+                        // freed count -- and everything sequenced before it, e.g. destructors --
+                        // is visible before this page can be handed back for reuse below.
+                        unused += page->unused_atomic.load(std::memory_order_acquire);
                         unused -= page->unused_counter_mutators;
                         if (unused > count / 2) {
                             page->unused_occur.store(false, std::memory_order_relaxed);
