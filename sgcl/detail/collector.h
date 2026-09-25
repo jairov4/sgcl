@@ -581,8 +581,34 @@ namespace sgcl::detail {
             }
         }
 
+        // Runs every unreachable object's finalizer before any object's children are cleared or destroyed, so a
+        // finalizer reads a fully intact object graph (the Python __del__ contract) even when its children are garbage too.
+        void _finalize_garbage() noexcept {
+            for (auto page = _unreachable_pages; page; page = page->next_unreachable) {
+                auto finalize = page->metadata->finalize;
+                if (!finalize) {
+                    continue;
+                }
+                auto states = page->states();
+                auto flags = page->flags();
+                auto count = page->flags_count();
+                for (unsigned i = 0; i < count; ++i) {
+                    auto unreachable = flags[i].registered & ~flags[i].marked;
+                    auto offset = i * Page::FlagBitCount;
+                    while (unreachable) {
+                        auto index = offset + std::countr_zero(unreachable);
+                        if (states[index].load(std::memory_order_relaxed) == State::Unreachable) {
+                            finalize(page->pointer_of(index));
+                        }
+                        unreachable &= unreachable - 1;
+                    }
+                }
+            }
+        }
+
         size_t _remove_garbage() noexcept {
             std::atomic_thread_fence(std::memory_order_acquire);
+            _finalize_garbage();
             size_t removed = 0;
             auto page = _unreachable_pages;
             _unreachable_pages = nullptr;

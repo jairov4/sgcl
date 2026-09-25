@@ -31,6 +31,16 @@ namespace sgcl::detail {
             }
         }
 
+        // A class exposing `void natpy_finalize() noexcept` gets it run by the collector once unreachable, before
+        // ANY unreachable object's children are cleared or destructors run, so it sees an intact object graph.
+        static constexpr auto get_finalize_function() -> void(*)(void*) noexcept {
+            if constexpr (!std::is_array_v<T> && !std::is_void_v<Type> && requires(Type& t) { t.natpy_finalize(); }) {
+                return &_finalize;
+            } else {
+                return nullptr;
+            }
+        }
+
         inline static void* user_metadata = nullptr;
 
         inline static auto& private_metadata() {
@@ -63,6 +73,10 @@ namespace sgcl::detail {
         }
 
     private:
+        static void _finalize(void* p) noexcept {
+            ((Type*)p)->natpy_finalize();
+        }
+
         static void _destroy(void* p) noexcept {
             std::destroy_at((T*)p);
         }

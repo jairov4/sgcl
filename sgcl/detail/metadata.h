@@ -14,6 +14,7 @@ namespace sgcl::detail {
         Metadata(T*) noexcept
         : child_pointers(TypeInfo<T>::child_pointers())
         , destroy(TypeInfo<T>::get_destroy_function())
+        , finalize(TypeInfo<T>::get_finalize_function())
         , free(TypeInfo<T>::Allocator::free)
         , object_size(TypeInfo<T>::ObjectSize)
         , object_count(TypeInfo<T>::ObjectCount)
@@ -24,6 +25,7 @@ namespace sgcl::detail {
 
         ChildPointers& child_pointers;
         void (*const destroy)(void*) noexcept;
+        void (*const finalize)(void*) noexcept;
         void (*const free)(Page*) noexcept;
         const size_t object_size;
         const unsigned object_count;
