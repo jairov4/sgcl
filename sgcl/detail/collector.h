@@ -609,6 +609,13 @@ namespace sgcl::detail {
         size_t _remove_garbage() noexcept {
             std::atomic_thread_fence(std::memory_order_acquire);
             _finalize_garbage();
+            // A finalizer that reads a child re-stores its pointer (-> Reachable); keep those objects and everything
+            // they reach for this cycle, else their own children would be destroyed under them.
+            _mark_updated<false>();
+            while (_reachable_pages) {
+                _mark_reachable();
+                _mark_updated<false>();
+            }
             size_t removed = 0;
             auto page = _unreachable_pages;
             _unreachable_pages = nullptr;
