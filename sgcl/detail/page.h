@@ -43,6 +43,13 @@ namespace sgcl::detail {
             }
         }
 
+        // A Page is placement-constructed in a block of TypeInfo<T>::HeaderSize bytes obtained from the
+        // unsized ::operator new, so `delete page` must release it with the matching unsized form (the
+        // implicit sized delete would pass sizeof(Page), not the allocated size).
+        static void operator delete(void* p, size_t) noexcept {
+            ::operator delete(p);
+        }
+
         std::atomic<State>* states() const noexcept {
             return (std::atomic<State>*)(this + 1);
         }
