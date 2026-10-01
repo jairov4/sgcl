@@ -31,6 +31,16 @@ namespace sgcl::detail {
             }
         }
 
+        // A class exposing `void natpy_finalize() noexcept` gets it run by the collector once unreachable, before
+        // ANY unreachable object's children are cleared or destructors run, so it sees an intact object graph.
+        static constexpr auto get_finalize_function() -> void(*)(void*) noexcept {
+            if constexpr (!std::is_array_v<T> && !std::is_void_v<Type> && requires(Type& t) { t.natpy_finalize(); }) {
+                return &_finalize;
+            } else {
+                return nullptr;
+            }
+        }
+
         inline static void* user_metadata = nullptr;
 
         inline static auto& private_metadata() {
@@ -43,9 +53,30 @@ namespace sgcl::detail {
             return *metadata;
         }
 
-        inline static ChildPointers child_pointers {!MayContainTracked<Type>::value, ObjectSize};
+        // Lazily constructed (mirrors private_metadata()/array_metadata()
+        // above), not a plain eagerly-initialized static data member: this
+        // member's constructor does real dynamic (heap-allocating)
+        // initialization via ChildPointers' std::vector `map`, so an eager
+        // `inline static` here would have unspecified initialization order
+        // relative to every other translation unit's own static-duration
+        // objects. A caller whose own static/dynamic initializer is the
+        // first thing to construct a tracked object of this type -- e.g. a
+        // module-level variable initializer that runs during C++ static
+        // initialization, before main() -- could otherwise observe this
+        // member not yet constructed (an under-sized/absent `map`), corrupting
+        // the child-pointer bitmap offset check in Pointer's constructor.
+        // A function-local static is guaranteed to initialize exactly once,
+        // on first call, regardless of static-initialization order.
+        inline static ChildPointers& child_pointers() {
+            static ChildPointers cp{!MayContainTracked<Type>::value, ObjectSize};
+            return cp;
+        }
 
     private:
+        static void _finalize(void* p) noexcept {
+            ((Type*)p)->natpy_finalize();
+        }
+
         static void _destroy(void* p) noexcept {
             std::destroy_at((T*)p);
         }

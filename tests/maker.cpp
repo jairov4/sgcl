@@ -68,3 +68,60 @@ TEST(Maker_Tests, InitializerListArrayConstructor) {
     EXPECT_EQ(foo[1].get_value(), 5);
     EXPECT_EQ(foo[2].get_value(), 6);
 }
+
+namespace {
+    std::atomic<bool> self_alias_ctor_done = {false};
+    std::atomic<bool> self_alias_destroyed_mid_construction = {false};
+
+    struct SelfAliasGroup;
+
+    struct SelfAliasNode {
+        tracked_ptr<SelfAliasGroup> children;
+        tracked_ptr<int> payload;
+
+        SelfAliasNode();
+
+        ~SelfAliasNode() {
+            if (!self_alias_ctor_done.load()) {
+                self_alias_destroyed_mid_construction = true;
+            }
+        }
+    };
+
+    struct SelfAliasGroup {
+        tracked_ptr<SelfAliasNode> owner;
+
+        explicit SelfAliasGroup(tracked_ptr<SelfAliasNode> o)
+        : owner(std::move(o)) {
+        }
+    };
+
+    // A constructor storing `this` into another tracked object (a child's back-reference to its
+    // owner) hands the pointer over through the same unique_ptr -> tracked_ptr path make_tracked's
+    // own result takes, while the object is still owned only by Maker's (non-root) unique_ptr.
+    SelfAliasNode::SelfAliasNode()
+    : children(make_tracked<SelfAliasGroup>(tracked_ptr<SelfAliasNode>(unique_ptr<SelfAliasNode>(detail::UniquePtr<SelfAliasNode>(this)))))
+    , payload(make_tracked<int>(7)) {
+        // Two full cycles: the first would demote a merely-Reachable slot to Used, the second would
+        // then find it unreferenced from any root and destroy it while this constructor is running.
+        collector::force_collect(true);
+        collector::force_collect(true);
+        self_alias_ctor_done = true;
+    }
+}
+
+TEST(Maker_Tests, SelfAliasDuringConstructionSurvivesCollection) {
+    self_alias_ctor_done = false;
+    self_alias_destroyed_mid_construction = false;
+    {
+        tracked_ptr<SelfAliasNode> node = make_tracked<SelfAliasNode>();
+        EXPECT_FALSE(self_alias_destroyed_mid_construction.load());
+        EXPECT_NE(node->payload, nullptr);
+        EXPECT_NE(node->children, nullptr);
+        EXPECT_EQ(node->children->owner.get(), node.get());
+        EXPECT_EQ(*node->payload, 7);
+    }
+    collector::force_collect(true);
+    collector::force_collect(true);
+    EXPECT_FALSE(self_alias_destroyed_mid_construction.load());
+}

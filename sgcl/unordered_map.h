@@ -557,7 +557,7 @@ namespace sgcl {
             return 0;
         }
 
-        iterator find(const Key& key) noexcept {
+        iterator find(const Key& key) {
             if (_buckets.size()) {
                 size_t idx = _bucket_index(key);
                 NodePtr current = _buckets[idx];
@@ -572,7 +572,7 @@ namespace sgcl {
         }
 
         template<class K> requires detail::HashableWith<K, Key, Hash, KeyEqual>
-        iterator find(const K& x) noexcept {
+        iterator find(const K& x) {
             if (_buckets.size()) {
                 size_t idx = _hash(x) % _buckets.size();
                 NodePtr current = _buckets[idx];
@@ -586,7 +586,7 @@ namespace sgcl {
             return end();
         }
 
-        const_iterator find(const Key& key) const noexcept {
+        const_iterator find(const Key& key) const {
             if (_buckets.size()) {
                 size_t idx = _bucket_index(key);
                 NodePtr current = _buckets[idx];
@@ -601,7 +601,7 @@ namespace sgcl {
         }
 
         template<class K> requires detail::HashableWith<K, Key, Hash, KeyEqual>
-        const_iterator find(const K& x) const noexcept {
+        const_iterator find(const K& x) const {
             if (_buckets.size()) {
                 size_t idx = _hash(x) % _buckets.size();
                 NodePtr current = _buckets[idx];
@@ -615,16 +615,16 @@ namespace sgcl {
             return end();
         }
 
-        size_t count(const Key& key) const noexcept {
+        size_t count(const Key& key) const {
             return find(key) != end();
         }
 
         template<class K> requires detail::HashableWith<K, Key, Hash, KeyEqual>
-        size_t count(const K& x) const noexcept {
+        size_t count(const K& x) const {
             return find(x) != end();
         }
 
-        bool contains(const Key& key) const noexcept {
+        bool contains(const Key& key) const {
             if (_buckets.size()) {
                 size_t idx = _bucket_index(key);
                 NodePtr current = _buckets[idx];
@@ -639,37 +639,37 @@ namespace sgcl {
         }
 
         template<class K> requires detail::HashableWith<K, Key, Hash, KeyEqual>
-        bool contains(const K& x) const noexcept {
+        bool contains(const K& x) const {
             return find(x) != end();
         }
 
-        std::pair<iterator, iterator> equal_range(const Key& key) noexcept {
+        std::pair<iterator, iterator> equal_range(const Key& key) {
             iterator it = find(key);
             return it == end() ? std::make_pair(it, it)
                                : std::make_pair(it, std::next(it));
         }
 
-        std::pair<const_iterator, const_iterator> equal_range(const Key& key) const noexcept {
+        std::pair<const_iterator, const_iterator> equal_range(const Key& key) const {
             const_iterator it = find(key);
             return it == end() ? std::make_pair(it, it)
                                : std::make_pair(it, std::next(it));
         }
 
         template <typename K> requires detail::HashableWith<K, Key, Hash, KeyEqual>
-        std::pair<iterator, iterator> equal_range(const K& x) noexcept {
+        std::pair<iterator, iterator> equal_range(const K& x) {
             iterator it = find(x);
             return it == end() ? std::make_pair(it, it)
                                : std::make_pair(it, std::next(it));
         }
 
         template <typename K> requires detail::HashableWith<K, Key, Hash, KeyEqual>
-        std::pair<const_iterator, const_iterator> equal_range(const K& x) const noexcept {
+        std::pair<const_iterator, const_iterator> equal_range(const K& x) const {
             const_iterator it = find(x);
             return it == end() ? std::make_pair(it, it)
                                : std::make_pair(it, std::next(it));
         }
 
-        node_type extract(const Key& key) noexcept {
+        node_type extract(const Key& key) {
             if (_buckets.size()) {
                 size_t idx = _bucket_index(key);
                 NodePtr current = _buckets[idx];
@@ -869,7 +869,7 @@ namespace sgcl {
         float _max_load_factor = {0.75f};
         size_t _size = {0};
 
-        size_t _bucket_index(const Key& key) const noexcept {
+        size_t _bucket_index(const Key& key) const {
             return _hash(key) % _buckets.size();
         }
 
@@ -900,7 +900,7 @@ namespace sgcl {
             }
         }
 
-        friend bool operator==(const unordered_map& lhs, const unordered_map& rhs) noexcept {
+        friend bool operator==(const unordered_map& lhs, const unordered_map& rhs) {
             if (lhs.size() != rhs.size()) {
                 return false;
             }
@@ -913,7 +913,7 @@ namespace sgcl {
             return true;
         }
 
-        friend bool operator!=(const unordered_map& lhs, const unordered_map& rhs) noexcept {
+        friend bool operator!=(const unordered_map& lhs, const unordered_map& rhs) {
             return !(lhs == rhs);
         }
     };

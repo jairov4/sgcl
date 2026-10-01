@@ -57,6 +57,12 @@ namespace sgcl::detail {
         Used = 0,
         Reachable = 1,
         UniqueLock = 2,
+        // Reachable | UniqueLock: the slot's constructor is currently running on the owning
+        // thread. Deliberately a superset of both bits so every ReachableMask/CreatedMask test
+        // in the collector treats it as a protected, registered object without special-casing;
+        // unlike UniqueLock, an aliasing store of this pointer (see Page::set_state<Reachable>)
+        // does not transition it out, only the end of the constructor does (-> UniqueLock).
+        Constructing = 3,
         Destroyed = 4,
         BadAlloc = 8,
         Reserved = 16,

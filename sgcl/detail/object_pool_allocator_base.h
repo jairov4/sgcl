@@ -23,14 +23,17 @@ namespace sgcl::detail {
             while (!_pointer_pool.is_empty()) {
                 auto ptr = _pointer_pool.alloc();
                 auto index = _current_page->index_of(ptr);
-                _current_page->states()[index].store(State::Unused, std::memory_order_relaxed);
+                // release: publishes this slot (and anything sequenced before it, e.g. the
+                // object's now-run destructor) to whichever thread's fill() next acquire-reads
+                // State::Unused off this page and reuses the memory for a new object.
+                _current_page->states()[index].store(State::Unused, std::memory_order_release);
                 ++unused_counter;
             }
             if (unused_counter) {
                 _current_page->unused_occur.store(true, std::memory_order_relaxed);
-                _current_page->unused_atomic.fetch_add(unused_counter, std::memory_order_relaxed);
+                // release: pairs with _release_unused_pages' acquire load of this counter.
+                _current_page->unused_atomic.fetch_add(unused_counter, std::memory_order_release);
             }
-            std::atomic_thread_fence(std::memory_order_release);
         }
 
         void* alloc(size_t = 0) {
