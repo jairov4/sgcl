@@ -31,12 +31,14 @@ namespace sgcl::detail {
         std::atomic<size_t> last_alloc_size = {0};
         std::atomic<size_t> free_count = {0};
         std::atomic<size_t> free_size = {0};
-        // The owner's SGCL_MAX_TYPES_NUMBER: it sizes Thread, so an image built with another value cannot share it.
-        const size_t max_types_number = config::MaxTypesNumber;
     };
 
 #if defined(SGCL_EXTERNAL_STATE)
-    SGCL_API ProcessState& process_state() noexcept;
+    SGCL_API ProcessState& SGCL_STATE_SYMBOL(process_state)() noexcept;
+
+    inline ProcessState& process_state() noexcept {
+        return SGCL_STATE_SYMBOL(process_state)();
+    }
 #else
     inline ProcessState& process_state() noexcept {
         static constinit ProcessState state;

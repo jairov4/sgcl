@@ -14,7 +14,15 @@
 #endif
 
 namespace mi::a {
-    // A ANode, a type only this image allocates.
+    // A tracked base class whose constructor runs in this image, so a subclass another image allocates builds this
+    // part's tracked_ptr members through this image's code.
+    struct Base : Node {
+        MI_API_a explicit Base(int payload);
+
+        sgcl::tracked_ptr<Node> extra;
+    };
+
+    // An ANode, a type only this image allocates.
     MI_API_a sgcl::unique_ptr<Node> make_node(int payload);
     // A plain Node allocated by this image's own allocator for it.
     MI_API_a sgcl::unique_ptr<Node> make_plain(int payload);

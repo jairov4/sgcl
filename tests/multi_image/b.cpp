@@ -6,8 +6,6 @@
 #define MI_BUILDING_b
 #include "b.h"
 
-#include "a.h"
-
 #include <thread>
 
 namespace mi::b {
@@ -16,6 +14,21 @@ namespace mi::b {
             using Node::Node;
             int b_tag = 0xbb;
         };
+
+        struct Derived : a::Base {
+            using Base::Base;
+            sgcl::tracked_ptr<Node> more;
+        };
+    }
+
+    sgcl::unique_ptr<Node> make_pair(int payload) {
+        auto node = make_node(payload);
+        node->next = a::make_node(payload + 1);
+        return node;
+    }
+
+    sgcl::unique_ptr<a::Base> make_derived(int payload) {
+        return sgcl::make_tracked<Derived>(payload);
     }
 
     sgcl::unique_ptr<Node> make_node(int payload) {
@@ -51,13 +64,5 @@ namespace mi::b {
                 head = node;
             }
         }).join();
-    }
-}
-
-namespace mi::b {
-    sgcl::unique_ptr<Node> make_pair(int payload) {
-        auto node = make_node(payload);
-        node->next = a::make_node(payload + 1);
-        return node;
     }
 }

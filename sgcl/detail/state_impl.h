@@ -16,19 +16,19 @@
 namespace sgcl::detail {
     constinit ProcessState process_state_instance;
 
-    ProcessState& process_state() noexcept {
+    ProcessState& SGCL_STATE_SYMBOL(process_state)() noexcept {
         return process_state_instance;
     }
 
     // Immortal: only an explicit sgcl::collector::terminate() stops it, never static destruction, which would run
     // under the Windows loader lock after other threads are gone.
-    Collector& collector_instance() {
+    Collector& SGCL_STATE_SYMBOL(collector_instance)() {
         static Collector* const collector = new Collector;
         return *collector;
     }
 
     // Unlike the header-only mode, no thread's exit terminates the collector.
-    Thread& current_thread_slow() noexcept {
+    Thread& SGCL_STATE_SYMBOL(current_thread)() noexcept {
         static thread_local Thread instance;
         return instance;
     }

@@ -152,6 +152,19 @@ int main() {
     }
     check(collect_until_alive(0), "the rooted ring is collected once dropped");
 
+    {
+        // Traced only if a's constructor registered `extra` with the Thread that b's allocation set up.
+        tracked_ptr<mi::a::Base> derived = mi::b::make_derived(300);
+        derived->extra = mi::a::make_node(301);
+        derived->next = mi::b::make_node(302);
+        for (int i = 0; i < 4; ++i) {
+            sgcl::collector::force_collect(true);
+        }
+        check(alive() == 3 && derived->extra->payload == 301 && derived->next->payload == 302,
+              "members built by another image's constructor keep their objects alive");
+    }
+    check(collect_until_alive(0), "an object built across images is collected once dropped");
+
     std::vector<std::thread> threads;
     bool intact[4] = {};
     for (int t = 0; t < 4; ++t) {
@@ -170,7 +183,7 @@ int main() {
           "the loading thread's exit leaves the collector running");
     check(collect_until_alive(0), "that library's nodes are finalized once and destroyed once");
     sgcl::collector::terminate();
-    check(sgcl::detail::Collector::terminated(), "an explicit terminate stops the collector");
+    check(sgcl::detail::Collector::terminated(), "an explicit terminate returns once the collector has stopped");
 
     std::printf("%s\n", failures ? "FAIL: multi-image collector" : "PASS: one collector serves every image");
     return failures;

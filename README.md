@@ -229,14 +229,21 @@ them. Define `SGCL_EXTERNAL_STATE` in every image to keep one copy per process i
   process state, the collector and each thread's `Thread`.
 - `SGCL_API` marks those definitions' linkage: `__declspec(dllexport)` in the owner and `__declspec(dllimport)` in
   every other image on Windows, where it is required, and `__attribute__((visibility("default")))` on ELF and Mach-O.
-- Every image agrees on `SGCL_EXTERNAL_STATE` and `SGCL_MAX_TYPES_NUMBER` (default 4096, the distinct tracked types per
-  process); an image built with another value aborts on its first allocation.
+- Every image agrees on `SGCL_EXTERNAL_STATE` and `SGCL_MAX_TYPES_NUMBER` (a decimal literal, default 4096: the distinct
+  tracked types per process). The exported names carry `SGCL_MAX_TYPES_NUMBER`, so an image built with another value
+  fails to link or load; one built without `SGCL_EXTERNAL_STATE` is not detected and keeps a collector of its own.
+- Every image shares one C++ runtime and heap, built with the same settings: memory one image allocates is freed by
+  the owner's collector thread. On Windows that means `/MD` everywhere (never a static CRT) and one
+  `_ITERATOR_DEBUG_LEVEL`, which changes the layout of the collector's containers.
 - No thread's exit stops the collector: call `sgcl::collector::terminate()` before the process exits, while every
   image is still loaded. Neither the collector nor anything it reads is ever destroyed, so static destruction and DLL
   detach cannot pull memory out from under it.
 - An image that has allocated tracked objects must stay loaded until the process exits: pages, finalizers and
   allocators keep pointers into its code. Each image may keep its own allocator, type index and `set_metadata` value
   per type, so on Windows every image counts the types it allocates against `SGCL_MAX_TYPES_NUMBER`.
+- A thread's `Thread` lives in the owner's thread-local storage. On Windows a thread-local `tracked_ptr` in another
+  image may be destroyed after it, so keep thread-local tracked pointers in the owner or clear them before the
+  thread exits.
 
 `tests/multi_image` builds an owner, two libraries and an executable sharing one collector, plus a library the
 executable loads from a worker thread. `-DSGCL_TEST_EXTERNAL_STATE=ON` runs the other test suites in this mode.

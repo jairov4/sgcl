@@ -36,12 +36,15 @@
 #endif
 #define SGCL_API
 #endif
-#define SGCL_STATE_DECL SGCL_API
-#else
-#define SGCL_STATE_DECL
+// Exported names carry SGCL_MAX_TYPES_NUMBER, which sizes Thread, so an image
+// built with another value fails to link or load instead of corrupting memory.
+#define SGCL_DETAIL_CAT2(a, b) a##b
+#define SGCL_DETAIL_CAT(a, b) SGCL_DETAIL_CAT2(a, b)
+#define SGCL_STATE_SYMBOL(name) SGCL_DETAIL_CAT(name##_max_types_, SGCL_MAX_TYPES_NUMBER)
 #endif
 
-// Distinct tracked types per process; each thread keeps one allocator slot per type.
+// Distinct tracked types per process; each thread keeps one allocator slot per
+// type. A decimal integer literal: it is pasted into exported names.
 #if !defined(SGCL_MAX_TYPES_NUMBER)
 #define SGCL_MAX_TYPES_NUMBER 4096
 #endif

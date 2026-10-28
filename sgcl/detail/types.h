@@ -75,11 +75,12 @@ namespace sgcl::detail {
     };
 
     void collector_init();
-    SGCL_STATE_DECL Collector& collector_instance();
+    Collector& collector_instance();
     void terminate_collector() noexcept;
     Thread& current_thread() noexcept;
 #if defined(SGCL_EXTERNAL_STATE)
-    SGCL_API Thread& current_thread_slow() noexcept;
+    SGCL_API Collector& SGCL_STATE_SYMBOL(collector_instance)();
+    SGCL_API Thread& SGCL_STATE_SYMBOL(current_thread)() noexcept;
 #endif
     void waking_up_collector() noexcept;
     void force_short_sleep() noexcept;

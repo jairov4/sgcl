@@ -909,7 +909,11 @@ namespace sgcl::detail {
         friend inline void delete_unique(const void*) noexcept;
     };
 
-#if !defined(SGCL_EXTERNAL_STATE)
+#if defined(SGCL_EXTERNAL_STATE)
+    inline Collector& collector_instance() {
+        return SGCL_STATE_SYMBOL(collector_instance)();
+    }
+#else
     inline Collector& collector_instance() {
         static Collector collector_instance;
         return collector_instance;

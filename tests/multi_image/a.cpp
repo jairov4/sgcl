@@ -16,6 +16,10 @@ namespace mi::a {
         };
     }
 
+    Base::Base(int payload)
+    : Node(payload) {
+    }
+
     sgcl::unique_ptr<Node> make_node(int payload) {
         return sgcl::make_tracked<ANode>(payload);
     }

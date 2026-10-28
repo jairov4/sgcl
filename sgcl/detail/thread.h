@@ -152,7 +152,8 @@ namespace sgcl::detail {
             }
             return static_cast<Allocator&>(*alocator);
         }
-        // Cached per image; the counter is process-wide, so types of different images never share a slot.
+        // Cached per image; the counter is in ProcessState, so under SGCL_EXTERNAL_STATE types of different images
+        // never share a slot.
         template<class T>
         inline static unsigned _type_index() {
             static const unsigned index = _next_type_index();
@@ -160,13 +161,7 @@ namespace sgcl::detail {
         }
 
         static unsigned _next_type_index() noexcept {
-            auto& state = process_state();
-            if (state.max_types_number != config::MaxTypesNumber) {
-                std::fprintf(stderr, "[sgcl] fatal: images disagree on SGCL_MAX_TYPES_NUMBER (%zu, %zu)\n",
-                             state.max_types_number, config::MaxTypesNumber);
-                std::abort();
-            }
-            auto index = state.type_counter.fetch_add(1, std::memory_order_relaxed);
+            auto index = process_state().type_counter.fetch_add(1, std::memory_order_relaxed);
             if (index >= config::MaxTypesNumber) {
                 std::fprintf(stderr, "[sgcl] fatal: more than %zu tracked types; raise SGCL_MAX_TYPES_NUMBER\n",
                              config::MaxTypesNumber);
@@ -177,11 +172,11 @@ namespace sgcl::detail {
     };
 
 #if defined(SGCL_EXTERNAL_STATE)
-    // The Thread lives in the owner's TLS; each image caches a pointer to it.
+    // The Thread lives in the owner's TLS; a pointer to it is cached per image, or shared where the loader merges it.
     inline Thread& current_thread() noexcept {
         thread_local Thread* thread = nullptr;
         if (!thread) [[unlikely]] {
-            thread = &current_thread_slow();
+            thread = &SGCL_STATE_SYMBOL(current_thread)();
         }
         return *thread;
     }
