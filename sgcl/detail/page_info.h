@@ -66,10 +66,12 @@ namespace sgcl::detail {
         // member not yet constructed (an under-sized/absent `map`), corrupting
         // the child-pointer bitmap offset check in Pointer's constructor.
         // A function-local static is guaranteed to initialize exactly once,
-        // on first call, regardless of static-initialization order.
+        // on first call, regardless of static-initialization order. Leaked like
+        // the metadata above: the collector reads it until it is terminated,
+        // which may be after static destruction.
         inline static ChildPointers& child_pointers() {
-            static ChildPointers cp{!MayContainTracked<Type>::value, ObjectSize};
-            return cp;
+            static auto cp = new ChildPointers{!MayContainTracked<Type>::value, ObjectSize};
+            return *cp;
         }
 
     private:

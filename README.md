@@ -220,6 +220,27 @@ No external library is necessary and there are no other requirements.
 ## Usage
 This is a header only library. You can just copy the `sgcl` subfolder somewhere in your include path.
 
+## Shared libraries
+By default each image (executable or shared library) gets its own copy of the collector, thread registry and counters.
+On Windows that means one collector per DLL, and objects passed between DLLs are freed by a collector that never saw
+them. Define `SGCL_EXTERNAL_STATE` in every image to keep one copy per process instead:
+
+- Exactly one translation unit of one image, the owner, includes `sgcl/detail/state_impl.h`, which defines the
+  process state, the collector and each thread's `Thread`.
+- `SGCL_API` marks those definitions' linkage: `__declspec(dllexport)` in the owner and `__declspec(dllimport)` in
+  every other image on Windows, where it is required, and `__attribute__((visibility("default")))` on ELF and Mach-O.
+- Every image agrees on `SGCL_EXTERNAL_STATE` and `SGCL_MAX_TYPES_NUMBER` (default 4096, the distinct tracked types per
+  process); an image built with another value aborts on its first allocation.
+- No thread's exit stops the collector: call `sgcl::collector::terminate()` before the process exits, while every
+  image is still loaded. Neither the collector nor anything it reads is ever destroyed, so static destruction and DLL
+  detach cannot pull memory out from under it.
+- An image that has allocated tracked objects must stay loaded until the process exits: pages, finalizers and
+  allocators keep pointers into its code. Each image may keep its own allocator, type index and `set_metadata` value
+  per type, so on Windows every image counts the types it allocates against `SGCL_MAX_TYPES_NUMBER`.
+
+`tests/multi_image` builds an owner, two libraries and an executable sharing one collector, plus a library the
+executable loads from a worker thread. `-DSGCL_TEST_EXTERNAL_STATE=ON` runs the other test suites in this mode.
+
 ## Compillers
 SGCL has been tested using clang, gcc and msvc compilers. 
 Due to issues with the destruction of thread-local objects and the TLS handling on Windows, using the gcc compiler on this system is not recommended.

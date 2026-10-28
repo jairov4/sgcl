@@ -24,7 +24,7 @@ namespace sgcl::detail {
 
         Collector() {
             if (!created()) {
-                _created = true;
+                process_state().collector_created = true;
                 std::thread([this]{_main_loop();}).detach();
             }
         }
@@ -43,7 +43,7 @@ namespace sgcl::detail {
             std::cout << "[sgcl] force collect " << (wait ? "and wait " : "") << "from id: " << std::this_thread::get_id() << std::endl;
 #endif
             if (wait) {
-                if (!_terminating) {
+                if (!process_state().collector_terminating) {
                     std::unique_lock<std::mutex> lock(_mutex);
                     _force_collect();
                     _cv_data_ready.wait(lock, [this] {
@@ -65,7 +65,7 @@ namespace sgcl::detail {
             std::flush(std::cout);
 #endif
             std::unique_lock<std::mutex> lock(_mutex);
-            if (!_terminating) {
+            if (!process_state().collector_terminating) {
                 _live_objects_request = true;
                 _force_collect();
                 _cv_data_ready.wait(lock, [this] {
@@ -96,11 +96,11 @@ namespace sgcl::detail {
         }
 
         inline static bool terminated() noexcept {
-            return _terminating.load();
+            return process_state().collector_terminating.load();
         }
 
         inline static bool created() {
-            return _created.load(std::memory_order_acquire);
+            return process_state().collector_created.load(std::memory_order_acquire);
         }
 
         inline std::vector<std::thread>& destroyer_threads() noexcept {
@@ -132,7 +132,7 @@ namespace sgcl::detail {
         }
 
         void _register_threads() {
-            auto first_thread = Thread::threads_data.load(std::memory_order_acquire);
+            auto first_thread = process_state().threads_data.load(std::memory_order_acquire);
             auto thread = first_thread;
             while(thread != _last_thread_registered) {
                 thread->next_registered = _registered_threads;
@@ -152,8 +152,8 @@ namespace sgcl::detail {
                 _last_thread_registered->is_last_registered = true;
             }
 
-            if (_terminating) {
-                Thread::threads_data.store(nullptr, std::memory_order_relaxed);
+            if (process_state().collector_terminating) {
+                process_state().threads_data.store(nullptr, std::memory_order_relaxed);
                 if (_last_thread_registered) {
                     _last_thread_registered->is_last_registered = false;
                 }
@@ -831,7 +831,7 @@ namespace sgcl::detail {
                         can_sleep = false;
                     }
                 }
-                if (!_terminating && can_sleep) {
+                if (!process_state().collector_terminating && can_sleep) {
                     sleep_flag.store(true, std::memory_order_relaxed);
                     std::unique_lock<std::mutex> lock(_mutex);
                     auto sleep_time = _short_sleep ? config::ShortSleepTime : config::LongSleepTime;
@@ -839,12 +839,12 @@ namespace sgcl::detail {
                     sleep_cv.wait_for(lock, sleep_time, [this]{
                         return !sleep_flag.load(std::memory_order_acquire)
                             || _forced_collect_count.load(std::memory_order_relaxed)
-                            || _terminating.load(std::memory_order_relaxed);
+                            || process_state().collector_terminating.load(std::memory_order_relaxed);
                     });
                 }
                 last_mem_allocated = MemoryCounters::alloc_counter();
                 MemoryCounters::reset_all();
-                if (!last_objects_removed && _terminating) {
+                if (!last_objects_removed && process_state().collector_terminating) {
                     if (_live_object_count) {
                         --finalization_counter;
                     } else {
@@ -858,7 +858,7 @@ namespace sgcl::detail {
 #if SGCL_LOG_PRINT_LEVEL > 0
             std::cout << "[sgcl] stop collector id: " << std::this_thread::get_id() << std::endl;
 #endif
-            if (_terminating) {
+            if (process_state().collector_terminating) {
                 _terminated = true;
                 _terminated.notify_all();
             }
@@ -870,13 +870,13 @@ namespace sgcl::detail {
         }
 
         void _terminate() noexcept {
-            if (!_terminating) {
+            if (!process_state().collector_terminating) {
 #if SGCL_LOG_PRINT_LEVEL > 0
                 std::cout << "[sgcl] terminate collector from id: " << std::this_thread::get_id() << std::endl;
 #endif
                 {
                     std::unique_lock<std::mutex> lock(_mutex);
-                    _terminating.store(true);
+                    process_state().collector_terminating.store(true);
                     waking_up();
                 }
                 _terminated.wait(false);
@@ -896,8 +896,6 @@ namespace sgcl::detail {
         std::atomic<bool> _live_objects_request = {false};
         std::atomic<bool> _terminated = {false};
         bool _share_live_objects = {false};
-        inline static std::atomic<bool> _created = {false};
-        inline static std::atomic<bool> _terminating = {false};
         std::condition_variable sleep_cv;
         std::atomic<bool> sleep_flag = {true};
         std::vector<uintptr_t> _hazard_pointers;
@@ -911,10 +909,12 @@ namespace sgcl::detail {
         friend inline void delete_unique(const void*) noexcept;
     };
 
+#if !defined(SGCL_EXTERNAL_STATE)
     inline Collector& collector_instance() {
         static Collector collector_instance;
         return collector_instance;
     }
+#endif
 
     inline void collector_init() {
         collector_instance();

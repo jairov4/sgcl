@@ -5,6 +5,8 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "state.h"
+
 #include <atomic>
 #include <thread>
 #include <vector>
@@ -73,9 +75,12 @@ namespace sgcl::detail {
     };
 
     void collector_init();
-    Collector& collector_instance();
+    SGCL_STATE_DECL Collector& collector_instance();
     void terminate_collector() noexcept;
     Thread& current_thread() noexcept;
+#if defined(SGCL_EXTERNAL_STATE)
+    SGCL_API Thread& current_thread_slow() noexcept;
+#endif
     void waking_up_collector() noexcept;
     void force_short_sleep() noexcept;
     std::vector<std::thread>& destroyer_threads() noexcept;

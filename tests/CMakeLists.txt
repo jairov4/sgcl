@@ -15,9 +15,13 @@ file(GLOB TEST_SOURCES "*.cpp")
 list(REMOVE_ITEM TEST_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/static_init.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/static_init_factory.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/external_state.cpp"
 )
 
-add_executable(tests ${TEST_SOURCES} types.h)
+# Runs the same suites with SGCL_EXTERNAL_STATE, the executable owning the state.
+option(SGCL_TEST_EXTERNAL_STATE "Build the tests with SGCL_EXTERNAL_STATE" OFF)
+
+add_executable(tests ${TEST_SOURCES} external_state.cpp types.h)
 target_link_libraries(tests gtest gtest_main sgcl)
 target_include_directories(tests PRIVATE ${CMAKE_SOURCE_DIR})
 add_test(NAME tests COMMAND tests)
@@ -26,7 +30,15 @@ add_executable(static_init_test
     static_init.cpp
     static_init_factory.cpp
     static_init.h
+    external_state.cpp
 )
 target_link_libraries(static_init_test gtest gtest_main sgcl)
 target_include_directories(static_init_test PRIVATE ${CMAKE_SOURCE_DIR})
 add_test(NAME static_init_test COMMAND static_init_test)
+
+if(SGCL_TEST_EXTERNAL_STATE)
+    target_compile_definitions(tests PRIVATE SGCL_EXTERNAL_STATE SGCL_API=)
+    target_compile_definitions(static_init_test PRIVATE SGCL_EXTERNAL_STATE SGCL_API=)
+endif()
+
+add_subdirectory(multi_image)

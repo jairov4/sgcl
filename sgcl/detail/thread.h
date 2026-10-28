@@ -9,6 +9,8 @@
 #include "object_pool_allocator.h"
 #include "stack_pointer_allocator.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 #if SGCL_LOG_PRINT_LEVEL >= 3
@@ -16,24 +18,26 @@
 #endif
 
 namespace sgcl::detail {
+    struct ThreadData {
+        ThreadData(BlockAllocator* b, StackPointerAllocator* s) noexcept
+        : block_allocator(b)
+        , stack_roots_allocator(s) {
+        }
+        std::unique_ptr<BlockAllocator> block_allocator;
+        std::unique_ptr<StackPointerAllocator> stack_roots_allocator;
+        std::atomic<bool> is_deleted = {false};
+        bool is_used = {true};
+        bool is_last_registered = {false};
+        ThreadData* next = {nullptr};
+        ThreadData* next_registered = {nullptr};
+        std::atomic<Page*> pages = {nullptr};
+        Page* last_page_registered = {nullptr};
+        RawPointer hazard_pointer = {nullptr};
+    };
+
     class Thread {
     public:
-        struct Data {
-            Data(BlockAllocator* b, StackPointerAllocator* s) noexcept
-            : block_allocator(b)
-            , stack_roots_allocator(s) {
-            }
-            std::unique_ptr<BlockAllocator> block_allocator;
-            std::unique_ptr<StackPointerAllocator> stack_roots_allocator;
-            std::atomic<bool> is_deleted = {false};
-            bool is_used = {true};
-            bool is_last_registered = {false};
-            Data* next = {nullptr};
-            Data* next_registered = {nullptr};
-            std::atomic<Page*> pages = {nullptr};
-            Page* last_page_registered = {nullptr};
-            RawPointer hazard_pointer = {nullptr};
-        };
+        using Data = ThreadData;
 
         struct ChildPointers {
             uintptr_t base;
@@ -83,18 +87,21 @@ namespace sgcl::detail {
 #if SGCL_LOG_PRINT_LEVEL >= 3
             std::cout << "[sgcl] start thread id: " << std::this_thread::get_id() << std::endl;
 #endif
+            auto& threads_data = process_state().threads_data;
             _data->next = threads_data.load(std::memory_order_acquire);
             while(!threads_data.compare_exchange_weak(_data->next, _data, std::memory_order_release, std::memory_order_relaxed));
         }
 
         ~Thread() noexcept {
             _data->is_deleted.store(true, std::memory_order_release);
+#if !defined(SGCL_EXTERNAL_STATE)
             if (std::this_thread::get_id() == main_thread_id) {
                 for (auto& a : _allocators) {
                     a.reset();
                 }
                 terminate_collector();
             }
+#endif
 #if SGCL_LOG_PRINT_LEVEL >= 3
             std::cout << "[sgcl] stop thread id: " << std::this_thread::get_id() << std::endl;
 #endif
@@ -123,8 +130,9 @@ namespace sgcl::detail {
 
         ChildPointers child_pointers = {0, nullptr};
         StackPointerAllocator* const stack_allocator;
-        inline static std::atomic<Data*> threads_data = {nullptr};
+#if !defined(SGCL_EXTERNAL_STATE)
         inline static std::thread::id main_thread_id = {};
+#endif
         std::pair<uintptr_t, uintptr_t> alloc_range = {0, 0};
 
     private:
@@ -144,15 +152,40 @@ namespace sgcl::detail {
             }
             return static_cast<Allocator&>(*alocator);
         }
+        // Cached per image; the counter is process-wide, so types of different images never share a slot.
         template<class T>
         inline static unsigned _type_index() {
-            static const unsigned index = _type_counter++;
-            assert(_type_counter < config::MaxTypesNumber);
+            static const unsigned index = _next_type_index();
             return index;
         }
-        inline static std::atomic<unsigned> _type_counter = {0};
+
+        static unsigned _next_type_index() noexcept {
+            auto& state = process_state();
+            if (state.max_types_number != config::MaxTypesNumber) {
+                std::fprintf(stderr, "[sgcl] fatal: images disagree on SGCL_MAX_TYPES_NUMBER (%zu, %zu)\n",
+                             state.max_types_number, config::MaxTypesNumber);
+                std::abort();
+            }
+            auto index = state.type_counter.fetch_add(1, std::memory_order_relaxed);
+            if (index >= config::MaxTypesNumber) {
+                std::fprintf(stderr, "[sgcl] fatal: more than %zu tracked types; raise SGCL_MAX_TYPES_NUMBER\n",
+                             config::MaxTypesNumber);
+                std::abort();
+            }
+            return index;
+        }
     };
 
+#if defined(SGCL_EXTERNAL_STATE)
+    // The Thread lives in the owner's TLS; each image caches a pointer to it.
+    inline Thread& current_thread() noexcept {
+        thread_local Thread* thread = nullptr;
+        if (!thread) [[unlikely]] {
+            thread = &current_thread_slow();
+        }
+        return *thread;
+    }
+#else
     struct MainThreadDetector {
         MainThreadDetector() noexcept {
             Thread::main_thread_id = std::this_thread::get_id();
@@ -165,4 +198,5 @@ namespace sgcl::detail {
         static thread_local Thread instance;
         return instance;
     }
+#endif
 }
