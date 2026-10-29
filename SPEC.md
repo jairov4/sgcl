@@ -67,8 +67,10 @@ Everything is in namespace `sgcl`. Headers: `sgcl/sgcl.h` (all of the below), an
 template<class T, class... A> unique_ptr<T> make_tracked(A&&... args);
 ```
 
-Allocates managed storage for one `T` and constructs it with `T(std::forward<A>(args)...)` (or `T` default-initialized
-when `args` is empty). `T` is a complete, non-array, non-void object type with `sizeof(T)` within the limit of §8, and
+Allocates managed storage for one `T` and constructs it with `T(std::forward<A>(args)...)`. With no `args`, a trivially
+default-constructible `T` is value-initialized (zeroed) and any other `T` is default-initialized: value-initialization
+would zero the storage before the members are constructed and defeat layout discovery (§4.4). `T` is a complete,
+non-array, non-void object type with `sizeof(T)` and `alignof(T)` within the limits of §8, and
 `std::is_nothrow_destructible_v<T>` (rejected at compile time otherwise). If the constructor throws, the exception
 propagates and the storage is reclaimed by a later cycle without running a destructor (§5). Out of memory is fatal
 (§5.7).
@@ -83,7 +85,9 @@ The owning handle `make_tracked` returns: the object is a root while a `unique_p
 - Destroying or resetting a non-empty `unique_ptr` destroys the object synchronously on the calling thread (no
   finalize hook, §4.7) and the slot is reclaimed by a later cycle.
 - Converting to `tracked_ptr` (constructor or assignment from `unique_ptr<U>&&`) hands the object over to the
-  collector; the `unique_ptr` becomes empty.
+  collector; the `unique_ptr` becomes empty. This is the only handover: any other `tracked_ptr` that refers to the
+  object while the `unique_ptr` owns it (`tracked_ptr(T*)` on it, an alias of `this` from its constructor) is an
+  alias that does not keep it alive past the `unique_ptr`'s reset.
 
 Nothing else from `std::unique_ptr` is part of the surface.
 
@@ -94,7 +98,7 @@ A nullable reference to a managed object, or to a subobject of one (a base class
 | Member | Semantics |
 |---|---|
 | `tracked_ptr()`, `tracked_ptr(nullptr_t)` | null |
-| `explicit tracked_ptr(U* p)`, `U*` convertible to `T*` | refers to `*p`. Preconditions in §5.8. |
+| `explicit tracked_ptr(U* p)`, `U*` convertible to `T*` | refers to `*p`, a live managed object (`Used`, `Reachable`, `UniqueLock` or `Constructing`; including a vector element) whose address lies in the first `PageSize` bytes of its allocation. Anything else is fatal (§5.8). |
 | `tracked_ptr(const tracked_ptr&)`, `tracked_ptr(const tracked_ptr<U>&)` | same object; upcast when `U* → T*` converts |
 | `tracked_ptr(tracked_ptr&&)`, `tracked_ptr(tracked_ptr<U>&&)` | same object; the source is null afterwards |
 | `tracked_ptr(unique_ptr<U>&&)` | takes the object over from the `unique_ptr` |
@@ -121,11 +125,9 @@ A moved-from `tracked_ptr` is null and fully usable (it can be read, compared, a
 A *managed type* is any `T` passed to `make_tracked<T>` or used as an element/key/value of an SGCL container.
 
 - **MUST** be nothrow-destructible.
-- **MUST** follow the layout rule of §4.4: every `tracked_ptr` the type's constructors place inside the object sits at
-  an offset that every construction of the type uses for a `tracked_ptr`, and a word that holds a `tracked_ptr` in one
-  object of the type holds a `tracked_ptr` or zero in every object of the type, at all times. In practice: no
-  `tracked_ptr` inside a `union`, a `std::variant`, or the small-buffer storage of a type-erased object (`std::function`,
-  `std::any`) constructed inside a managed object.
+- **MAY** place `tracked_ptr`s anywhere inside the object, conditionally too, including inside a `union`, a
+  `std::variant`, a `std::optional` or the small-buffer storage of a type-erased object (`std::function`, `std::any`):
+  §4.4 says which become children and how foreign data at a child offset is handled.
 - **MAY** declare the finalize hook (§4.7).
 
 ### 3.5 `vector<T>`
@@ -150,12 +152,12 @@ A contiguous, growable array in managed storage. `T` is a managed type (§3.4).
 | `insert(pos, const T&)`, `insert(pos, T&&)` | returns an iterator to the inserted element; the argument may alias an element |
 | `insert(pos, first, last)` | forward iterators; the range may be in the same vector |
 | `erase(pos)`, `erase(first, last)` | returns an iterator after the last erased element |
-| `resize(n)`, `resize(n, const T&)` | |
+| `resize(n)`, `resize(n, const T&)` | new elements as `make_tracked` builds them with no arguments (§3.1), or copies |
 | `clear()` | destroys every element; keeps the storage |
 | `swap(vector&)` | |
 
-Iterators, pointers and references are invalidated as for `std::vector`. A stale iterator never refers to freed memory
-while it is reachable from a root (the old storage stays alive), but its value is unspecified.
+Iterators are plain element pointers (`T*`). They, and pointers and references to elements, are invalidated as for
+`std::vector`, and they do not keep the storage alive.
 
 ### 3.6 `unordered_map<K, V, Hash, KeyEqual>`
 
@@ -192,10 +194,10 @@ the elements it visits afterwards are unspecified. Iteration order is unspecifie
 
 | Function | Semantics |
 |---|---|
-| `static bool force_collect(bool wait = false) noexcept` | Requests a collection. With `wait`, blocks until a full cycle that **started after the call** has finished: every object unreachable at the call has been finalized or destroyed, except objects kept by a finalizer during that cycle (§4.7). Returns `false` without blocking when the collector is shutting down, or when called on the collector thread (a finalize hook or a destructor); the request is still made in the latter case. Any number of threads may wait concurrently. |
-| `static size_t get_live_object_count() noexcept` | Number of objects found live by the last completed cycle, including SGCL's internal allocations. Never blocks, never forces a cycle; 0 before the first cycle completes. |
-| `static std::tuple<pause_guard, std::vector<void*>> get_live_objects()` | Forces a cycle and returns the addresses of every object it found live. The collector stays paused, and the addresses stay valid, until the returned `pause_guard` is destroyed. **MUST NOT** be called on the collector thread or while the calling thread holds another `pause_guard` (fatal, §5.8). |
-| `static void terminate() noexcept` | Stops the collector (§4.10) and returns when it has stopped. Idempotent. **MUST NOT** be called on the collector thread (fatal, §5.8). |
+| `static bool force_collect(bool wait = false) noexcept` | Requests a collection. With `wait`, blocks until two full cycles that **started after the call** have finished (the first may keep objects allocated just before it began, §4.6 step 3): every object unreachable at the call has been finalized or destroyed, except objects kept by a finalizer (§4.7). Returns `false` without blocking when the collector is shutting down, or when called on the collector thread (a finalize hook or a destructor); the request is still made in the latter case. Any number of threads may wait concurrently. |
+| `static size_t get_live_object_count() noexcept` | Number of objects found live by the last completed cycle, including SGCL's internal allocations. Never blocks, never forces a cycle, never creates the collector; 0 before the first cycle completes. |
+| `static std::tuple<pause_guard, std::vector<void*>> get_live_objects() noexcept` | Forces a cycle and returns the addresses of every object it marked live (an object kept only by the sweep's defence in depth, §4.6 step 9, is not listed). The collector stays paused, and the addresses stay valid, until the returned `pause_guard` is destroyed; a second caller waits until then. The guard **MUST** be destroyed on the thread that obtained it. **MUST NOT** be called on the collector thread or while the calling thread holds a `pause_guard` (fatal, §5.8). |
+| `static void terminate() noexcept` | Stops the collector (§4.10) and returns when it has stopped; called before any SGCL use, it prevents the collector from ever starting. Idempotent. **MUST NOT** be called on the collector thread or while the calling thread holds a `pause_guard` (fatal, §5.8). |
 
 ### 3.8 Configuration and the process state
 
@@ -206,7 +208,8 @@ the elements it visits afterwards are unspecified. Iteration order is unspecifie
 | `SGCL_FINALIZE_HOOK` | The name of the finalize hook member function (default `sgcl_finalize`). Every image **MUST** use the same value. |
 
 `sgcl/state_impl.h` defines the process state. Exactly one translation unit of exactly one image of the process **MUST**
-include it. That image is the *owner*: it **MUST** stay loaded until the process exits.
+include it. That image is the *owner*. The owner, and every image that allocated a managed object (its per-type
+destroy, finalize and free functions live in that image, §4.9), **MUST** stay loaded until the process exits.
 
 ## 4. Design
 
@@ -224,6 +227,9 @@ include it. That image is the *owner*: it **MUST** stay loaded until the process
 - **Large allocation**: vector storage that does not fit a data page gets its own `PageSize`-aligned allocation with
   the page-header pointer in word 0 and exactly one slot. Only addresses within its first `PageSize` bytes may be
   passed to `page_of`; SGCL only ever passes the start of the storage.
+- **Page registry** (process-wide): one bit per `PageSize` region of a 48-bit address space, set while the region
+  starts a live data page or large allocation. Set by the allocating thread before any of its slots is handed out,
+  cleared by the collector before the page's memory is reused. Managed memory above 2^48 is fatal.
 - **Metadata** (one per managed type per image, immutable once built): destroy function, finalize function, size, slot
   count, child-pointer layout (§4.4), and the type's allocator entry point.
 
@@ -252,10 +258,11 @@ Transitions; *M* is the allocating or storing mutator thread, *C* the collector:
 | `Reserved` → `Constructing` | M | `make_tracked`, before the constructor |
 | `Constructing` → `UniqueLock` | M | the constructor returned |
 | `Constructing` → `BadAlloc` | M | the constructor threw |
-| `UniqueLock`, `Used`, `Reachable` → `Reachable` | M | write barrier: a non-null pointer to the slot was stored into any `tracked_ptr` |
-| `Constructing` → `Constructing` | M | write barrier during construction (an alias of `this`): ownership is not handed over |
+| `Used`, `Reachable` → `Reachable` | M | write barrier: a non-null pointer to the slot was stored into any `tracked_ptr`; always an atomic RMW on the state |
+| `UniqueLock`, `Constructing` → unchanged | M | write barrier on an object still owned or under construction: an alias, not a handover |
+| `UniqueLock` → `Reachable` | M | handover: a `tracked_ptr` is built or assigned from the owning `unique_ptr` (§3.2) |
 | `BadAlloc`, `Destroyed` → unchanged | M | write barrier on a dead slot (a pointer that leaked out of a failed constructor): ignored, see §5.1 |
-| `Reachable` → `Used` | C | start of each cycle (§4.6 step 3) |
+| `Reachable` → `Used` | C | start of each cycle (§4.6 step 1), a compare-and-swap |
 | `UniqueLock` → `Destroyed` | M | `unique_ptr` destruction or reset; external-root cell dropped |
 | `Used` → `Unused` | C | swept: finalized (if it has a hook), children cleared, destroyed |
 | `Destroyed`, `BadAlloc` → `Unused` | C | swept without running a destructor |
@@ -291,12 +298,17 @@ the first construction of the type:
   offset in the map and becomes null. When the constructor returns, the layout is published as final (release).
 - Every later construction zero-fills the storage first. A child `tracked_ptr` whose offset is in the final layout is
   a child; one whose offset is not becomes an external root (§4.3), so a conditional member is never left untraced.
-- If the discovering constructor throws, the layout is not published and the next construction discovers again; the
-  storage of the failed construction is zero-filled before its slot can be reused.
+- If the discovering constructor throws, the layout is not published and the next construction discovers again. A
+  vector element whose construction threw is zeroed at once; a `make_tracked` slot is filled again when it is reused.
 
-Consequence (the layout rule of §3.4): the collector reads every recorded offset of every live object of the type as a
-`tracked_ptr` cell. A word at a recorded offset that holds anything other than a cell or zero (a `variant`/`union`
-alternative, small-buffer storage of a different callable) is read as a pointer, which is undefined behaviour.
+The collector reads every recorded offset of every live object of the type. In type-erased or variant storage the same
+offset may hold a cell in one object and foreign data (an integer, a raw pointer, a different callable's state) in
+another, so a word is traced only when it points into a live SGCL page, found in the process-wide *page registry*
+(§4.1) and bounded to the page's slots; anything else is ignored. A foreign value that happens to point into a live
+page keeps that slot's object alive for the cycle (conservative retention, never a crash). A `tracked_ptr`'s ref word
+(§4.3) is never such a value: it is either the cell itself, 0, or an address with tag bits outside the registered
+range. Before destroying an object the sweep nulls only the recorded words that hold a referent, so a foreign raw
+pointer into managed memory kept at such a word reads as null in that object's destructor.
 
 ### 4.5 Write barrier
 
@@ -310,16 +322,20 @@ during a cycle is shaded and survives the cycle. Objects that become unreachable
 
 The collector thread repeats:
 
-1. **Register threads and pages**: link newly created thread records and pages (acquire loads of the lock-free lists).
+1. **Start the epoch**: clear `reachable` and `marked`; on pages with `state_updated` set, demote `Reachable` to `Used`
+   (a CAS that never overwrites a handover or a destruction). A barrier this erases is an RMW on the same state, so
+   it synchronizes with the demotion: everything its thread did before it is visible to the steps below.
+2. **Register threads and pages**: link newly created thread records and pages (acquire loads of the lock-free lists).
    Drop the records of threads that exited; their pages stay and keep being collected.
-2. **Register objects**: on each page whose `object_created` flag is set, set the `registered` bit of every slot whose
-   state is in `CreatedMask`. Unregistered slots are never candidates for sweeping.
-3. **Start the epoch**: clear `reachable` and `marked`; on pages with `state_updated` set, demote `Reachable` to `Used`.
+3. **Register objects**: on each page whose `object_created` flag is set, set the `registered` bit of every slot whose
+   state is in `CreatedMask`. Unregistered slots are never candidates for sweeping and are never traced: an object
+   created after this step survives the cycle, and the barrier shades what it references.
 4. **Scan stack roots**: mark every non-null cell of every live thread's shadow stack.
 5. **Mark to a fixpoint**: drain gray slots, tracing their children through the type's layout (for vector storage,
-   every element up to `capacity`, relying on unconstructed elements being zero). Then rescan pages for slots that
-   became protected (`ReachableMask`) concurrently, registering late threads, pages and objects, until nothing new is
-   gray. Pages left with unmarked, unprotected slots are the *unreachable pages*.
+   every element up to `capacity`, relying on unconstructed elements being zero). One scan of every registered page
+   grays the slots that are protected (`ReachableMask`); after that, only pages that still hold unmarked, unprotected
+   slots (the *unreachable pages*) are rescanned for slots the barrier protected meanwhile, until nothing new is
+   gray. The work is bounded by the registered slots, so allocation never keeps a cycle from finishing.
 6. **Publish the live count** of this cycle (§3.7).
 7. **Finalize** (§4.7).
 8. **Resurrection pass**: mark everything a finalizer (or a mutator) made reachable during step 7, to a fixpoint.
@@ -380,13 +396,17 @@ exit and no static destructor stops the collector.
 
 ### 4.10 Forced collection and termination
 
-- A forced collection increments a request generation. The collector finishes its current cycle, then runs one full
-  cycle, and publishes that cycle's generation as completed. A waiter blocks until the completed generation reaches
-  the one it requested, so concurrent waiters never miss a wake-up.
+- A forced collection increments a request generation. Each cycle records the latest generation requested when it
+  started, and when a cycle finishes it publishes the generation the previous cycle recorded as completed, so a
+  request completes after two full cycles that started after it. A waiter blocks until the completed generation
+  reaches the one it requested, so concurrent waiters never miss a wake-up. A `get_live_objects()` snapshot lists the
+  objects marked by the cycle that completes its request, and the collector pauses right after that cycle.
 - `terminate()` sets the terminating flag, wakes the collector and blocks until it has stopped. The collector keeps
-  cycling until a cycle reclaims nothing, at most five more times while live objects remain, then stops. Objects still
-  reachable then are never finalized or destroyed. After termination, allocation keeps working and nothing is
-  collected; the collector cannot be restarted.
+  cycling until a cycle reclaims nothing, for at most 5 cycles, and starts none later than 1 s after the request, so
+  threads that keep allocating cannot hold it for long. Objects still reachable then, or not reached by those cycles,
+  are never finalized or destroyed. After termination, allocation keeps working and nothing is collected; the
+  collector cannot be restarted. Called before the collector exists, `terminate()` only sets the flag, and the
+  collector created later never starts.
 
 ## 5. Behaviour per situation
 
@@ -397,7 +417,7 @@ exit and no static destructor stops the collector.
 | `T`'s constructor returns | slot `Constructing` → `UniqueLock`; `make_tracked` returns the owning `unique_ptr` |
 | `T`'s constructor throws | slot → `BadAlloc`, the exception propagates unchanged; no destructor runs for the object (its members were destroyed by the language); the slot is reclaimed by a later cycle |
 | `T`'s constructor stores `this` into a `tracked_ptr` (anywhere) and returns | the object stays `Constructing` until the constructor returns, then is owned by the `unique_ptr` as usual |
-| `T`'s constructor stores `this` and then throws | the leaked `tracked_ptr` refers to a dead slot. The write barrier never revives a `BadAlloc` slot, so the slot is reclaimed; using the leaked pointer afterwards is the program's use-after-destruction, as in plain C++ |
+| `T`'s constructor stores `this` and then throws | the leaked `tracked_ptr` refers to a dead slot. The write barrier never revives a `BadAlloc` slot and no destructor ever runs for it; while the leaked pointer refers to it the slot is traced (its members were destroyed, so it holds no references) and counted live, and it is reclaimed once nothing refers to it. Using the leaked pointer is the program's use-after-destruction, as in plain C++ |
 | The first constructor of a type throws during layout discovery | discovery restarts on the next construction (§4.4) |
 
 ### 5.2 `vector`
@@ -424,7 +444,7 @@ a moved-from state), and the vector stays usable. A failed operation never leave
 | `find` | `Hash`, `KeyEqual` | no effect |
 | `erase(k)` | `Hash`, `KeyEqual` | **strong** |
 | rehash (inside an insertion) | — | never throws: it uses stored hashes |
-| `clear`, `erase(iterator)`, iteration, `size`, `~unordered_map` | — | `noexcept` |
+| `clear`, iteration, `size`, `~unordered_map` | — | `noexcept` |
 
 ### 5.4 Finalize hooks and destructors
 
@@ -436,7 +456,8 @@ type whose destructor or hook is not `noexcept` is rejected at compile time.
 | Situation | Behaviour |
 |---|---|
 | A thread's first SGCL use | its record (shadow stack, allocators) is created; the thread is registered with the collector |
-| A thread exits | its record is marked dead; unused pool slots return to `Unused`; its pages stay and are collected normally |
+| A thread exits | its record is retired: unused pool slots return to `Unused`, then the record is published as dead; its pages stay and are collected normally |
+| SGCL is used on a thread after its record retired (a `thread_local` destructor that runs later, a static destructor on the main thread) | fatal diagnostic (§5.8); destroying or reading an existing `tracked_ptr` is still allowed |
 | A detached thread still runs after `terminate()` | it keeps working; nothing is collected any more |
 | The collector thread allocates or stores pointers (in a hook or destructor) | it is a regular SGCL thread for that purpose |
 
@@ -463,24 +484,25 @@ Each of these is detected in every build mode (not only with assertions enabled)
 
 | Misuse | Detection |
 |---|---|
-| `tracked_ptr(U* p)` where `p` points into SGCL storage whose slot is not live (`Unused`, `Reserved`, `Destroyed`, `BadAlloc`) | slot state check |
-| `tracked_ptr(U* p)` where `*p` is still owned by a `unique_ptr` (`UniqueLock`) | slot state check |
+| `tracked_ptr(U* p)` where `p` is not in the first `PageSize` bytes of a live page | page registry |
+| `tracked_ptr(U* p)` where `p`'s slot is not live (`Unused`, `Reserved`, `Destroyed`, `BadAlloc`) | slot state check |
 | More than `SGCL_MAX_TYPES_NUMBER` managed types | type counter |
 | A stack root deeper than `MaxStackSize` from its thread's stack base | shadow-stack index |
 | `get_live_objects()` or `terminate()` on the collector thread | thread identity |
-| `get_live_objects()` while the calling thread holds a `pause_guard` | thread identity |
+| `get_live_objects()`, `force_collect(true)` or `terminate()` while the calling thread holds a `pause_guard` | thread identity |
+| Any SGCL use that needs the thread's record after it retired at thread exit | retired flag |
 
 These are not detected and are undefined behaviour: dereferencing a null `tracked_ptr`, `vector::operator[]` out of
-range, `front`/`back`/`pop_back` on an empty vector, a data race on one non-atomic `tracked_ptr` or container, a type
-breaking the layout rule (§3.4), passing a pointer that does not point into SGCL storage at all to `tracked_ptr(U*)`
-(it may point anywhere; only addresses inside SGCL data pages are checked), and using an object after its constructor
-threw.
+range, `front`/`back`/`pop_back` on an empty vector, a data race on one non-atomic `tracked_ptr` or container, a
+`pause_guard` destroyed on another thread, and using an object after its constructor threw or after its `unique_ptr`
+destroyed it.
 
 ## 6. Exception-safety contract
 
-- A function of SGCL is `noexcept` exactly when it runs no user code that may throw. User code is: constructors and
-  assignment operators of `T`/`K`/`V`, `Hash` and `KeyEqual` calls, and iterator operations of a range passed to
-  `insert`. Where it depends on `T`, the function is conditionally `noexcept`.
+- A function of SGCL that runs no user code is `noexcept`. User code is: constructors and assignment operators of
+  `T`/`K`/`V`, `Hash` and `KeyEqual` calls, and iterator operations of a range passed to `insert`. A function that runs
+  user code is not `noexcept` (`vector::erase` is conditionally `noexcept`), so an exception from that code always
+  propagates to the caller.
 - Destructors of managed types and finalize hooks are required to be `noexcept`, so destroying an object never throws.
 - Out of memory is not an exception in SGCL (§5.7), so a function that only allocates is `noexcept`.
 - Every function that may throw states its guarantee in §5; the strong guarantee is given wherever `std::vector` or
@@ -507,6 +529,9 @@ Each handoff between a mutator and the collector is a release store paired with 
 | thread record `is_deleted` | `is_deleted` before dropping the record |
 | child layout `final` | `final` before compacting the layout |
 | array `metadata` after the elements are zeroed | `metadata` before tracing the elements |
+| a child cell's initial null (a relaxed atomic store: the storage may already be traced, and null needs no ordering) | child-field loads while tracing |
+| page registry bit set (release) after the page header word | registry lookup (acquire) before reading the header |
+| write barrier (RMW on the slot state, acq_rel) | epoch demotion (CAS, acq_rel) |
 | pool slots returned at thread exit (`Unused` store, `unused_atomic` add) | page release accounting |
 
 | Publication (collector, release) | Observation (mutator, acquire) |
@@ -514,27 +539,32 @@ Each handoff between a mutator and the collector is a release store paired with 
 | slot set `Unused` after destruction | `Unused` before reusing the slot |
 | page taken off / put on the free-page list | `on_empty_list` |
 
-The lock-free stacks (threads, pages, free pages) are push-only from mutators except the free-page stack, whose pops
-are protected against ABA (§9 tracks the remaining review item).
+The thread and page lists are push-only from mutators and are read by the collector, which keeps the newest entry as a
+sentinel so a freed entry is never the head it compares against. The process-wide free-page stack and each type's
+buffer of partly free pages are popped by mutators and refilled by the collector under a spin lock (a CAS pop would be
+ABA-prone against the collector's re-sorting).
 
 ## 8. Limits
 
 | Limit | Value |
 |---|---|
 | Size of one object passed to `make_tracked` | about 64 KiB (`PageSize - 8` minus the array header); compile-time error beyond |
+| Alignment of a managed type or vector element | at most `alignof(void*)`; compile-time error beyond |
+| Address space | managed memory below 2^48 (the page registry); fatal beyond |
 | Number of managed types per process | `SGCL_MAX_TYPES_NUMBER` (default 4096); fatal beyond |
 | Depth of a thread's stack that holds `tracked_ptr`s | `MaxStackSize` (8 MiB) from the stack base; fatal beyond |
 | Addresses on x86-64 | user heap and stack addresses have the two highest bits clear (they carry storage-class tags) |
-| Stack switching | fibers, coroutines on separate stacks, `longjmp` across `tracked_ptr`s: unsupported |
+| Stack switching | fibers, coroutines on separate stacks, `longjmp` across `tracked_ptr`s, sanitizer fake stacks (ASan `detect_stack_use_after_return`): unsupported |
 | Cycles through external roots | never collected |
+| Allocation rate | one collector thread; mutators allocating faster than it can mark and sweep make cycles longer, not incorrect |
 | Collector restarts | none: once terminated, the collector stays stopped |
 
 ## 9. Open design questions
 
-- **Free-page stack ABA.** The pops from the shared free-page stack and the per-type page buffer use a single-word
-  compare-and-swap; the audit must either show that no page can be popped, reused and pushed back between the load and
-  the CAS, or add a tag.
 - **Hash caching cost.** Each node stores its hash (one word). This trades memory for never calling `Hash` on stored
   keys; revisit if node size matters.
+- **Unknown stack base.** Where the platform does not report a thread's stack base, the shadow stack is indexed by
+  address modulo `MaxStackSize`, and two live stack roots `MaxStackSize` apart share a cell. Every supported platform
+  reports it.
 - **Shadow-stack size.** `MaxStackSize` is fixed at 8 MiB per thread of virtual address space; deriving it from each
   thread's real stack size would lift the depth limit.

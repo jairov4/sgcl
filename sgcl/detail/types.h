@@ -5,9 +5,11 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "fatal.h"
 #include "state.h"
 
 #include <atomic>
+#include <cstdint>
 #include <thread>
 #include <vector>
 
@@ -24,8 +26,6 @@ namespace sgcl::detail {
     class  Collector;
     struct Counter;
     struct DataPage;
-    template<class>
-    class  ArrayIterator;
     template<class>
     struct MayContainTracked;
     template<class>
@@ -45,25 +45,21 @@ namespace sgcl::detail {
     template<unsigned, unsigned>
     class  PointerPool;
     class  PointerPoolBase;
-    template <class>
-    class  RootContainerAllocator;
     struct StackPointerAllocator;
     class  Thread;
-    class  Timer;
-    class  Tracked;
+    // Base of tracked_ptr: lets metadata recognise arrays whose elements are only tracked_ptrs.
+    class  Tracked {};
     template<class>
     struct TypeInfo;
     struct UniqueDeleter;
 
+    // SPEC.md §4.2.
     enum State : uint8_t {
         Used = 0,
         Reachable = 1,
         UniqueLock = 2,
-        // Reachable | UniqueLock: the slot's constructor is currently running on the owning
-        // thread. Deliberately a superset of both bits so every ReachableMask/CreatedMask test
-        // in the collector treats it as a protected, registered object without special-casing;
-        // unlike UniqueLock, an aliasing store of this pointer (see Page::set_state<Reachable>)
-        // does not transition it out, only the end of the constructor does (-> UniqueLock).
+        // Reachable | UniqueLock: the constructor is running. A superset of both bits, so every ReachableMask and
+        // CreatedMask test treats it as protected and registered; a store of the pointer does not hand it over.
         Constructing = 3,
         Destroyed = 4,
         BadAlloc = 8,
@@ -74,14 +70,11 @@ namespace sgcl::detail {
         CreatedMask = 15
     };
 
-    void collector_init();
-    Collector& collector_instance();
-    void terminate_collector() noexcept;
+    void collector_init() noexcept;
+    Collector& collector_instance() noexcept;
     Thread& current_thread() noexcept;
-#if defined(SGCL_EXTERNAL_STATE)
-    SGCL_API Collector& SGCL_STATE_SYMBOL(collector_instance)();
+    SGCL_API Collector& SGCL_STATE_SYMBOL(collector_instance)() noexcept;
     SGCL_API Thread& SGCL_STATE_SYMBOL(current_thread)() noexcept;
-#endif
     void waking_up_collector() noexcept;
     void force_short_sleep() noexcept;
     std::vector<std::thread>& destroyer_threads() noexcept;

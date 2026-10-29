@@ -11,6 +11,7 @@
 #include <cstring>
 
 namespace sgcl::detail {
+    // The header of one data page or large allocation (SPEC.md §4.1).
     struct Page {
         template<class T>
         using Info = TypeInfo<T>;
@@ -18,10 +19,12 @@ namespace sgcl::detail {
         using Flag = uint64_t;
         static constexpr unsigned FlagBitCount = sizeof(Flag) * 8;
 
+        // Collector-private bitmaps, one bit per slot.
         struct Flags {
             Flag registered = {0};
             Flag reachable = {0};
             Flag marked = {0};
+            Flag finalized = {0};
         };
 
         template<class T>
@@ -30,22 +33,19 @@ namespace sgcl::detail {
         , block(block)
         , data((uintptr_t)data)
         , multiplier((1ull << 32 | 0x10000) / metadata->object_size) {
-            assert(metadata != nullptr);
             assert(data != nullptr);
-            std::memset(this->states(), State::Reserved, metadata->object_count);
-            std::memset(this->flags(), 0, sizeof(Flags) * this->flags_count());
-        }
-
-        ~Page() noexcept {
-            if constexpr(!std::is_trivially_destructible_v<std::atomic<State>>) {
-                auto states = this->states();
-                std::destroy(states, states + metadata->object_count);
+            auto states = this->states();
+            for (unsigned i = 0; i < metadata->object_count; ++i) {
+                new (&states[i]) std::atomic<State>(State::Reserved);
+            }
+            auto flags = this->flags();
+            for (unsigned i = 0; i < flags_count(); ++i) {
+                new (&flags[i]) Flags();
             }
         }
 
-        // A Page is placement-constructed in a block of TypeInfo<T>::HeaderSize bytes obtained from the
-        // unsized ::operator new, so `delete page` must release it with the matching unsized form (the
-        // implicit sized delete would pass sizeof(Page), not the allocated size).
+        // Placement-constructed in a block of TypeInfo<T>::HeaderSize bytes from the unsized ::operator new, so
+        // `delete page` must use the matching unsized form.
         static void operator delete(void* p, size_t) noexcept {
             ::operator delete(p);
         }
@@ -80,65 +80,48 @@ namespace sgcl::detail {
             return Flag(1) << (i % FlagBitCount);
         }
 
-        unsigned index_of(const void* p) noexcept {
-            assert(p != nullptr);
+        unsigned index_of(const void* p) const noexcept {
             return ((uintptr_t)p - data) * multiplier >> 32;
         }
 
-        void* pointer_of(unsigned index) noexcept {
+        void* pointer_of(unsigned index) const noexcept {
             return (void*)(data + index * metadata->object_size);
         }
 
         static Page* page_of(const void* p) noexcept {
-            assert(p != nullptr);
             auto page = ((uintptr_t)p & ~(uintptr_t)(config::PageSize - 1));
             return *((Page**)page);
         }
 
-        static Metadata& metadata_of(const void* p) noexcept {
-            assert(p != nullptr);
-            auto page = Page::page_of(p);
-            return *page->metadata;
+        static void* base_address_of(const void* p) noexcept {
+            auto page = page_of(p);
+            return page->pointer_of(page->index_of(p));
         }
 
-        static void* base_address_of(const void* p) noexcept {
-            assert(p != nullptr);
+        static std::atomic<State>& state_of(const void* p) noexcept {
             auto page = page_of(p);
-            auto index = page->index_of(p);
-            return page->pointer_of(index);
+            return page->states()[page->index_of(p)];
         }
 
         template<State S>
         static void set_state(const void* p) noexcept {
-            assert(p != nullptr);
             auto page = Page::page_of(p);
-            auto index = page->index_of(p);
-            auto &state = page->states()[index];
-            if constexpr(S == State::Constructing
-                      || S == State::UniqueLock
-                      || S == State::BadAlloc) {
+            auto& state = page->states()[page->index_of(p)];
+            if constexpr(S == State::Constructing || S == State::UniqueLock || S == State::BadAlloc) {
                 state.store(S, std::memory_order_relaxed);
-                // also flag state_updated: a slot stuck in Constructing/UniqueLock (mid-construction,
-                // e.g. the slow child-pointer-discovery path) must keep being re-scanned by
-                // _mark_updated's fast (state_updated-gated) path once its page is already on
-                // _unreachable_pages -- otherwise its registered-but-not-yet-marked bit can ride along
-                // unexamined until _remove_garbage, which only re-derives (registered & ~marked)
-                // without re-checking whether the state is still protected, and can destroy a
-                // half-constructed object.
+                // state_updated too: a slot that stays Constructing/UniqueLock while its page is already on the
+                // unreachable list must keep being rescanned, or the sweep could destroy it.
                 page->state_updated.store(true, std::memory_order_release);
                 page->object_created.store(true, std::memory_order_release);
             } else if constexpr(S == State::Reachable) {
-                // A store of this pointer into a tracked pointer while its constructor is still
-                // running (the constructor aliasing `this` into a child, e.g. a back-reference) is
-                // not an ownership handover: the object is still only owned by the unique_ptr that
-                // Maker::_make will return, which is not a GC root. Reachable is transient (the
-                // next cycle's _update_states demotes it to Used), so downgrading Constructing
-                // here would leave the still-under-construction object with no protection at
-                // all, and the collector would destroy it -- and recycle its slot -- out from
-                // under the running constructor. Only UniqueLock (constructor finished, still
-                // owned by a unique_ptr) is handed over by a store.
-                if (state.load(std::memory_order_relaxed) != State::Constructing) {
-                    state.store(S, std::memory_order_relaxed);
+                // The write barrier (SPEC.md §4.2, §4.5): only Used is promoted. UniqueLock and Constructing keep
+                // their protection (a store is an alias, not a handover), and a dead or free slot is never revived.
+                // Always an RMW, so it is ordered against the collector's Reachable -> Used demotion and the cell
+                // store before it is visible to the cycle that demotes.
+                auto current = state.load(std::memory_order_relaxed);
+                while ((current == State::Used || current == State::Reachable)
+                       && !state.compare_exchange_weak(current, State::Reachable, std::memory_order_acq_rel,
+                                                       std::memory_order_relaxed)) {
                 }
                 page->state_updated.store(true, std::memory_order_release);
             } else {
@@ -146,12 +129,11 @@ namespace sgcl::detail {
             }
         }
 
-        static bool is_unique(const void* p) noexcept {
-            assert(p != nullptr);
+        // A unique_ptr gives its object to a tracked_ptr: UniqueLock -> Reachable.
+        static void hand_over(const void* p) noexcept {
             auto page = Page::page_of(p);
-            auto index = page->index_of(p);
-            auto &state = page->states()[index];
-            return state.load(std::memory_order_acquire) == State::UniqueLock;
+            page->states()[page->index_of(p)].exchange(State::Reachable, std::memory_order_acq_rel);
+            page->state_updated.store(true, std::memory_order_release);
         }
 
         Metadata* const metadata;
@@ -167,6 +149,9 @@ namespace sgcl::detail {
         std::atomic_bool state_updated = {false};
         std::atomic_bool on_empty_list = {false};
         std::atomic_bool unused_occur = {true};
+        // Slots refilled into a pool from this page: written by the mutator that took the page off its type's
+        // page buffer, before its release store of on_empty_list = false; read and reset by the collector only
+        // after acquiring that store.
         unsigned int unused_counter_mutators = {0};
         unsigned int unused_counter_gc = {0};
         std::atomic_uint unused_atomic = {0};
@@ -174,8 +159,6 @@ namespace sgcl::detail {
         Page* next_unreachable = {nullptr};
         Page* next_registered = {nullptr};
         Page* next_empty = {nullptr};
-        Page* next_unused = {nullptr};
-        Page* next_atomic = {nullptr};
         Page* next = {nullptr};
     };
 }

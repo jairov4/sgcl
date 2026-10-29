@@ -5,14 +5,23 @@
 //------------------------------------------------------------------------------
 #pragma once
 
-#include "detail/array_ptr.h"
 #include "detail/pointer.h"
-#include "detail/tracked.h"
 #include "make_tracked.h"
 #include "unique_ptr.h"
 #include "types.h"
 
+#include <atomic>
+#include <compare>
+#include <cstdlib>
+#include <functional>
+
 namespace sgcl {
+    namespace detail {
+        struct TrackedPtrAccess;
+    }
+
+    // SPEC.md §3.3. The cell lives on the shadow stack, inside the managed object, or in an external-root cell,
+    // decided at construction (§4.3).
     template<class T>
     class tracked_ptr : detail::Tracked {
 #ifdef SGCL_ARCH_X86_64
@@ -24,442 +33,355 @@ namespace sgcl {
 #endif
         static constexpr uintptr_t ClearMask = ~(StackFlag | ExternalHeapFlag);
 
+        struct AdoptTag {};
+
     public:
         using element_type = T;
 
         tracked_ptr() noexcept {
-            if (!_set_ref_if_not_external_heap()) {
-                auto ptr = make_tracked<detail::Pointer>();
-                detail::Pointer* ref = ptr.release();
-                _raw_ptr_ref = _set_flag(ref, ExternalHeapFlag);
-            }
-        };
+            _init();
+        }
 
-        constexpr tracked_ptr(std::nullptr_t)
+        tracked_ptr(std::nullptr_t) noexcept
         : tracked_ptr() {
         }
 
-        template<class U, std::enable_if_t<std::is_convertible_v<U*, element_type*>, int> = 0>
+        // Preconditions in SPEC.md §5.8.
+        template<class U, std::enable_if_t<std::is_convertible_v<U*, T*>, int> = 0>
         explicit tracked_ptr(U* p) noexcept
         : tracked_ptr() {
-            assert(!p || !detail::Page::is_unique(p));
-            _ptr()->store(static_cast<element_type*>(p));
+            if (p) {
+                _check_adoptable(p);
+                _cell()->store(static_cast<T*>(p));
+            }
         }
 
         tracked_ptr(const tracked_ptr& p) noexcept
         : tracked_ptr() {
-            _ptr()->store(p.get());
+            _cell()->store(p.get());
         }
 
-        template<class U, std::enable_if_t<std::is_convertible_v<typename tracked_ptr<U>::element_type*, element_type*>, int> = 0>
+        template<class U, std::enable_if_t<std::is_convertible_v<U*, T*>, int> = 0>
         tracked_ptr(const tracked_ptr<U>& p) noexcept
         : tracked_ptr() {
-            _ptr()->store(static_cast<element_type*>(p.get()));
+            _cell()->store(static_cast<T*>(p.get()));
         }
 
         tracked_ptr(tracked_ptr&& p) noexcept {
-            if (!_set_ref_if_not_external_heap()) {
-                if (p.allocated_on_external_heap()) {
-                    _raw_ptr_ref = p._raw_ptr_ref;
-                    p._raw_ptr_ref = _set_flag(decltype(_raw_ptr_ref)(nullptr), ExternalHeapFlag);
-                } else {
-                    auto ptr = make_tracked<detail::Pointer>();
-                    auto ref = ptr.release();
-                    _raw_ptr_ref = _set_flag(ref, ExternalHeapFlag);
-                    ref->store(p.get());
-                }
-            } else {
-                _ptr()->store(p.get());
-            }
+            _init_from_move(p);
         }
 
-        template<class U, std::enable_if_t<std::is_convertible_v<typename tracked_ptr<U>::element_type*, element_type*>, int> = 0>
+        template<class U, std::enable_if_t<std::is_convertible_v<U*, T*>, int> = 0>
         tracked_ptr(tracked_ptr<U>&& p) noexcept {
-            if (!_set_ref_if_not_external_heap()) {
-                if (p.allocated_on_external_heap()) {
-                    _raw_ptr_ref = p._raw_ptr_ref;
-                    _ptr()->store_no_update(static_cast<element_type*>(p.get()));
-                    p._raw_ptr_ref = _set_flag(decltype(_raw_ptr_ref)(nullptr), ExternalHeapFlag);
-                } else {
-                    auto ptr = make_tracked<detail::Pointer>();
-                    auto ref = ptr.release();
-                    _raw_ptr_ref = _set_flag(ref, ExternalHeapFlag);
-                    ref->store(static_cast<element_type*>(p.get()));
-                }
-            } else {
-                _ptr()->store(static_cast<element_type*>(p.get()));
-            }
+            _init_from_move(p);
         }
 
-        template<class U, std::enable_if_t<std::is_convertible_v<typename unique_ptr<U>::element_type*, element_type*>, int> = 0>
+        template<class U, std::enable_if_t<std::is_convertible_v<U*, T*>, int> = 0>
         tracked_ptr(unique_ptr<U>&& u) noexcept
         : tracked_ptr() {
-            _ptr()->store(static_cast<element_type*>(u.release()));
+            _cell()->store_handover(static_cast<T*>(u.release()));
         }
 
         ~tracked_ptr() noexcept {
-            if (allocated_on_external_heap()) {
-                if (auto ptr = _ptr()) {
-                    detail::Page::set_state<detail::State::Destroyed>(ptr);
-                }
+            if (_is_external()) {
+                _drop_cell();
             } else {
-                _ptr()->store(nullptr);
+                _cell()->store(nullptr);
             }
         }
 
         tracked_ptr& operator=(std::nullptr_t) noexcept {
-            if (auto ptr = _ptr()) {
-                ptr->store(nullptr);
-            } else {
-                auto new_ptr = make_tracked<detail::Pointer>();
-                auto ref = new_ptr.release();
-                _raw_ptr_ref = _set_flag(ref, ExternalHeapFlag);
-                ref->store(nullptr);
-            }
+            reset();
             return *this;
         }
 
         tracked_ptr& operator=(const tracked_ptr& p) noexcept {
-            if (auto self_ptr = _ptr()) {
-                self_ptr->store(p.get());
-            } else {
-                auto new_ptr = make_tracked<detail::Pointer>();
-                auto ref = new_ptr.release();
-                _raw_ptr_ref = _set_flag(ref, ExternalHeapFlag);
-                ref->store(p.get());
-            }
+            _writable_cell()->store(p.get());
             return *this;
         }
 
-        template<class U, std::enable_if_t<std::is_convertible_v<typename tracked_ptr<U>::element_type*, element_type*>, int> = 0>
+        template<class U, std::enable_if_t<std::is_convertible_v<U*, T*>, int> = 0>
         tracked_ptr& operator=(const tracked_ptr<U>& p) noexcept {
-            if (auto self_ptr = _ptr()) {
-                self_ptr->store(static_cast<element_type*>(p.get()));
-            } else {
-                auto new_ptr = make_tracked<detail::Pointer>();
-                auto ref = new_ptr.release();
-                _raw_ptr_ref = _set_flag(ref, ExternalHeapFlag);
-                ref->store(static_cast<element_type*>(p.get()));
-            }
+            _writable_cell()->store(static_cast<T*>(p.get()));
             return *this;
         }
 
-        template<class U, std::enable_if_t<std::is_convertible_v<typename unique_ptr<U>::element_type*, element_type*>, int> = 0>
+        template<class U, std::enable_if_t<std::is_convertible_v<U*, T*>, int> = 0>
         tracked_ptr& operator=(unique_ptr<U>&& u) noexcept {
-            auto p = u.release();
-            if (auto self_ptr = _ptr()) {
-                self_ptr->store(static_cast<element_type*>(p));
-            } else {
-                auto new_ptr = make_tracked<detail::Pointer>();
-                auto ref = new_ptr.release();
-                _raw_ptr_ref = _set_flag(ref, ExternalHeapFlag);
-                ref->store(static_cast<element_type*>(p));
-            }
+            _writable_cell()->store_handover(static_cast<T*>(u.release()));
             return *this;
         }
 
         tracked_ptr& operator=(tracked_ptr&& p) noexcept {
-            if (auto ptr = _ptr()) {
-                ptr->store(p.get());
-            } else {
-                if (p.allocated_on_external_heap()) {
-                    _raw_ptr_ref = p._raw_ptr_ref;
-                    p._raw_ptr_ref = _set_flag(decltype(_raw_ptr_ref)(nullptr), ExternalHeapFlag);
-                } else {
-                    auto ptr = make_tracked<detail::Pointer>();
-                    auto ref = ptr.release();
-                    _raw_ptr_ref = _set_flag(ref, ExternalHeapFlag);
-                    ref->store(p.get());
-                }
-            }
+            _assign_from_move(p);
             return *this;
         }
 
-        template<class U, std::enable_if_t<std::is_convertible_v<typename unique_ptr<U>::element_type*, element_type*>, int> = 0>
+        template<class U, std::enable_if_t<std::is_convertible_v<U*, T*>, int> = 0>
         tracked_ptr& operator=(tracked_ptr<U>&& p) noexcept {
-            if (auto ptr = _ptr()) {
-                ptr->store(static_cast<element_type*>(p.get()));
-            } else {
-                if (p.allocated_on_external_heap()) {
-                    _raw_ptr_ref = p._raw_ptr_ref;
-                    _ptr()->store_no_update(static_cast<element_type*>(p.get()));
-                    p._raw_ptr_ref = _set_flag(decltype(_raw_ptr_ref)(nullptr), ExternalHeapFlag);
-                } else {
-                    auto ptr = make_tracked<detail::Pointer>();
-                    auto ref = ptr.release();
-                    _raw_ptr_ref = _set_flag(ref, ExternalHeapFlag);
-                    ref->store(static_cast<element_type*>(p.get()));
-                }
-            }
+            _assign_from_move(p);
             return *this;
-        }
-
-        operator tracked_ptr<void>&() noexcept {
-            return *(tracked_ptr<void>*)(this);
-        }
-
-        operator const tracked_ptr<void>&() const noexcept {
-            return *(const tracked_ptr<void>*)(this);
         }
 
         explicit operator bool() const noexcept {
-            return (get() != nullptr);
+            return get() != nullptr;
         }
 
         template <class U = element_type, std::enable_if_t<!std::is_void_v<U>, int> = 0>
         U& operator*() const noexcept {
-            assert(get() != nullptr);
             return *get();
         }
 
         template <class U = element_type, std::enable_if_t<!std::is_void_v<U>, int> = 0>
         U* operator->() const noexcept {
-            assert(get() != nullptr);
             return get();
         }
 
         element_type* get() const noexcept {
-            return (element_type*)_ptr()->load();
-        }
-
-        void* get_base() const noexcept {
-            return _ptr()->data_base_address();
+            return (element_type*)_cell()->load();
         }
 
         void reset() noexcept {
-            if (allocated_on_external_heap() && !_ptr()) {
-                auto ptr = make_tracked<detail::Pointer>();
-                auto ref = ptr.release();
-                _raw_ptr_ref = _set_flag(ref, ExternalHeapFlag);
+            if (!_has_null_cell()) {
+                _cell()->store(nullptr);
             }
-            _ptr()->store(nullptr);
         }
 
         void swap(tracked_ptr& p) noexcept {
-            if (allocated_on_external_heap() && p.allocated_on_external_heap()) {
-                std::swap(_raw_ptr_ref, p._raw_ptr_ref);
+            if (_is_external() && p._is_external()) {
+                std::swap(_ref, p._ref);
             } else {
-                tracked_ptr<element_type> t = *this;
+                tracked_ptr t(*this);
                 *this = p;
                 p = t;
             }
         }
 
-        template<class U>
-        bool is() const noexcept {
-            return type() == typeid(U);
+    private:
+        explicit tracked_ptr(T* p, AdoptTag) noexcept
+        : tracked_ptr() {
+            _cell()->store(p);
         }
 
-        template<class U>
-        tracked_ptr<U> as() const noexcept {
-            if (is<U>()) {
-                return tracked_ptr<U>((typename tracked_ptr<U>::element_type*)get_base());
-            } else {
-                return {nullptr};
-            }
-        }
-
-        const std::type_info& type() const noexcept {
-            return _ptr()->template type_info<element_type>();
-        }
-
-        template<class M = void>
-        M* metadata() const noexcept {
-            return (M*)_ptr()->template metadata<element_type>();
-        }
-
-        bool is_array() const noexcept {
-            return _ptr()->is_array();
-        }
-
-        size_t object_size() const noexcept {
-            return _ptr()->object_size();
-        }
-
-        bool allocated_on_heap() const noexcept {
-            return !((uintptr_t)_raw_ptr_ref & (StackFlag | ExternalHeapFlag));
-        }
-
-        bool allocated_on_stack() const noexcept {
-            return (uintptr_t)_raw_ptr_ref & StackFlag;
-        }
-
-        bool allocated_on_external_heap() const noexcept {
-            return (uintptr_t)_raw_ptr_ref & ExternalHeapFlag;
-        }
-
-    protected:
-        static constexpr auto _set_flag(auto p, uintptr_t f) noexcept {
+        // The ref word names the cell and its storage class. On x86-64 a child keeps its cell in the word itself
+        // and the others tag the cell's address with the two highest bits; elsewhere a child's word is 0 and the
+        // others hold the complement of the tagged address. Either way a ref word is never an address inside the
+        // 48-bit range the page registry covers, so the collector never mistakes one for a referent (SPEC.md §4.4).
+        static uintptr_t _encode(detail::Pointer* cell, uintptr_t flag) noexcept {
 #ifdef SGCL_ARCH_X86_64
-            assert(!((uintptr_t)p & ~ClearMask) && "Cannot use SGCL_ARCH_X86_64");
+            if ((uintptr_t)cell & ~ClearMask) {
+                detail::fatal("an address uses the two highest bits (SPEC.md §8)");
+            }
+            return (uintptr_t)cell | flag;
+#else
+            return ~((uintptr_t)cell | flag);
 #endif
-            auto v = (uintptr_t)p | f;
-            return (decltype(p))v;
         }
 
-        static constexpr auto _remove_flags(auto p) noexcept {
-            auto v = (uintptr_t)p & ClearMask;
-            return (decltype(p))v;
+        uintptr_t _flags() const noexcept {
+#ifdef SGCL_ARCH_X86_64
+            return _ref & ~ClearMask;
+#else
+            return _ref ? ~_ref & ~ClearMask : 0;
+#endif
         }
 
-        constexpr bool this_on_stack() const noexcept {
+        detail::Pointer* _decoded() const noexcept {
+#ifdef SGCL_ARCH_X86_64
+            return (detail::Pointer*)(_ref & ClearMask);
+#else
+            return (detail::Pointer*)(~_ref & ClearMask);
+#endif
+        }
+
+        bool _this_on_stack() const noexcept {
             uintptr_t this_addr = (uintptr_t)this;
             uintptr_t stack_addr = (uintptr_t)&this_addr;
             ptrdiff_t offset = this_addr - stack_addr;
-            return std::abs(offset) <= config::MaxOffsetForStackDetection;
+            return std::abs(offset) <= (ptrdiff_t)config::MaxOffsetForStackDetection;
         }
 
-        constexpr bool this_on_heap(std::pair<uintptr_t, uintptr_t> state) const noexcept {
-            return ((uintptr_t)this - state.first) < state.second;
+        bool _is_external() const noexcept {
+            return _flags() & ExternalHeapFlag;
+        }
+
+        bool _is_stack() const noexcept {
+            return _flags() & StackFlag;
+        }
+
+        bool _is_child() const noexcept {
+            return !_flags();
+        }
+
+        static detail::Pointer* _null_cell() noexcept {
+            return reinterpret_cast<detail::Pointer*>(&detail::process_state().null_cell);
+        }
+
+        bool _has_null_cell() const noexcept {
+            return _is_external() && _decoded() == _null_cell();
+        }
+
+        detail::Pointer* _cell() const noexcept {
+            if (_is_child()) [[likely]] {
+                return const_cast<detail::Pointer*>(&_raw_ptr);
+            }
+            return _decoded();
         }
 
 #ifdef SGCL_ARCH_X86_64
-        detail::Pointer* _ptr() noexcept {
-#if defined(__GNUC__) || defined(__clang__)
-            if (__builtin_expect(allocated_on_heap(), 1)) {
-#else
-            if (allocated_on_heap()) {
-#endif
-                return &_raw_ptr;
-            }
-            return _remove_flags(_raw_ptr_ref);
-        }
-
-        const detail::Pointer* _ptr() const noexcept {
-#if defined(__GNUC__) || defined(__clang__)
-            if (__builtin_expect(allocated_on_heap(), 1)) {
-#else
-            if (allocated_on_heap()) {
-#endif
-                return &_raw_ptr;
-            }
-            return _remove_flags(_raw_ptr_ref);
-        }
-
         union {
-            detail::Pointer* _raw_ptr_ref;
+            uintptr_t _ref;
             detail::Pointer _raw_ptr;
         };
 #else
-        detail::Pointer* _ptr() noexcept {
-            return _remove_flags(_raw_ptr_ref);
-        }
-
-        const detail::Pointer* _ptr() const noexcept {
-            return _remove_flags(_raw_ptr_ref);
-        }
-
-        detail::Pointer* _raw_ptr_ref;
+        uintptr_t _ref;
         union {
             detail::Pointer _raw_ptr;
         };
 #endif
 
-    private:
-        bool _set_ref_if_not_external_heap() noexcept {
+        // A writable cell: a moved-from external root gets a fresh one.
+        detail::Pointer* _writable_cell() noexcept {
+            if (_has_null_cell()) {
+                _ref = _encode(_new_external_cell(), ExternalHeapFlag);
+            }
+            return _cell();
+        }
+
+        static detail::Pointer* _new_external_cell() noexcept {
+            return detail::Maker<detail::Pointer>::make_tracked().release();
+        }
+
+        void _drop_cell() noexcept {
+            if (!_has_null_cell()) {
+                detail::Page::set_state<detail::State::Destroyed>(_cell());
+            }
+        }
+
+        // Chooses the storage class (SPEC.md §4.3) and leaves the cell null.
+        void _init() noexcept {
+            if (!_init_stack_or_child()) {
+                _ref = _encode(_new_external_cell(), ExternalHeapFlag);
+            }
+        }
+
+        bool _init_stack_or_child() noexcept {
             auto& thread = detail::current_thread();
-            if (this_on_stack()) {
-                auto ref = thread.stack_allocator->alloc(this);
-                _raw_ptr_ref = _set_flag(ref, StackFlag);
-            } else {
-                if (this_on_heap(thread.alloc_range)) {
-#ifndef SGCL_ARCH_X86_64
-                    _raw_ptr_ref = &_raw_ptr;
-#else
-                    assert(!((uintptr_t)&_raw_ptr & ~ClearMask) && "Cannot use SGCL_ARCH_X86_64");
-#endif
-                    new (&_raw_ptr) detail::Pointer();
-                } else {
-                    return false;
-                }
+            if (_this_on_stack()) {
+                _ref = _encode(thread.stack_allocator->alloc(this), StackFlag);
+                _cell()->store(nullptr);
+                return true;
             }
-            return true;
-        };
+            auto& c = thread.construction;
+            auto cell = (uintptr_t)&_raw_ptr;
+            if (cell - c.base < c.size && c.layout->claim(&_raw_ptr, cell - c.base)) {
+#ifndef SGCL_ARCH_X86_64
+                _ref = 0;
+#endif
+                // An atomic store, not a constructor: the collector may already trace this storage.
+                std::atomic_ref<void*>(*reinterpret_cast<void**>(&_raw_ptr)).store(nullptr, std::memory_order_relaxed);
+                return true;
+            }
+            return false;
+        }
 
-        template<class> friend class atomic;
-        template<class> friend class atomic_ref;
+        template<class U>
+        void _init_from_move(tracked_ptr<U>& p) noexcept {
+            auto value = static_cast<T*>(p.get());
+            if (_init_stack_or_child()) {
+                _cell()->store(value);
+            } else if (p._is_external()) {
+                // Take the source's cell; the source gets the shared null cell.
+                _ref = p._ref;
+                if (!_has_null_cell()) {
+                    _cell()->store_no_update(value);
+                }
+                p._ref = _encode(_null_cell(), ExternalHeapFlag);
+                return;
+            } else {
+                _ref = _encode(_new_external_cell(), ExternalHeapFlag);
+                _cell()->store(value);
+            }
+            p.reset();
+        }
+
+        template<class U>
+        void _assign_from_move(tracked_ptr<U>& p) noexcept {
+            if ((void*)this == (void*)&p) {
+                return;
+            }
+            auto value = static_cast<T*>(p.get());
+            if (_is_external() && p._is_external() && !p._has_null_cell()) {
+                _drop_cell();
+                _ref = p._ref;
+                _cell()->store_no_update(value);
+                p._ref = _encode(_null_cell(), ExternalHeapFlag);
+                return;
+            }
+            _writable_cell()->store(value);
+            p.reset();
+        }
+
+        // SPEC.md §5.8: a live object in the first PageSize bytes of a managed allocation.
+        static void _check_adoptable(const void* p) noexcept {
+            if (!detail::process_state().pages.contains(p)) {
+                detail::fatal("tracked_ptr(T*) on memory SGCL does not manage");
+            }
+            auto page = detail::Page::page_of(p);
+            if (page->index_of(p) >= page->metadata->object_count) {
+                detail::fatal("tracked_ptr(T*) on memory SGCL does not manage");
+            }
+            auto state = detail::Page::state_of(p).load(std::memory_order_acquire);
+            if (!(state & detail::State::ReachableMask) && state != detail::State::Used) {
+                detail::fatal("tracked_ptr(T*) on a destroyed or free object");
+            }
+        }
+
         template<class> friend class tracked_ptr;
-        template<class> friend class detail::Maker;
+        template<class> friend class vector;
+        template<class, class, class, class> friend class unordered_map;
+        friend struct detail::TrackedPtrAccess;
+        template<class U, class V> friend tracked_ptr<U> dynamic_pointer_cast(const tracked_ptr<V>&) noexcept;
     };
-
-    template<class T>
-    class tracked_ptr<T[]> : public detail::ArrayPtr<T, tracked_ptr<T>> {
-        using Base = detail::ArrayPtr<T, tracked_ptr<T>>;
-
-    public:
-        using Base::Base;
-        using Base::operator=;
-    };
-
-    template <typename T>
-    tracked_ptr(T*) -> tracked_ptr<T>;
-
-    template <typename T>
-    tracked_ptr(tracked_ptr<T>) -> tracked_ptr<T>;
-
-    template <typename T>
-    tracked_ptr(unique_ptr<T>&&) -> tracked_ptr<T>;
 
     template<class T, class U>
     inline std::strong_ordering operator<=>(const tracked_ptr<T>& l, const tracked_ptr<U>& r) noexcept {
         using Y = typename std::common_type<decltype(l.get()), decltype(r.get())>::type;
-        return static_cast<Y>(l.get()) <=> static_cast<Y>(r.get());
+        return std::compare_three_way()(static_cast<Y>(l.get()), static_cast<Y>(r.get()));
     }
 
     template<class T, class U>
     inline bool operator==(const tracked_ptr<T>& l, const tracked_ptr<U>& r) noexcept {
-        return (l <=> r) == 0;
+        using Y = typename std::common_type<decltype(l.get()), decltype(r.get())>::type;
+        return static_cast<Y>(l.get()) == static_cast<Y>(r.get());
     }
 
     template<class T>
     inline std::strong_ordering operator<=>(const tracked_ptr<T>& l, std::nullptr_t) noexcept {
-        return l.get() <=> static_cast<decltype(l.get())>(nullptr);
+        return std::compare_three_way()(l.get(), static_cast<T*>(nullptr));
     }
 
     template<class T>
     inline bool operator==(const tracked_ptr<T>& l, std::nullptr_t) noexcept {
-        return (l <=> nullptr) == 0;
+        return l.get() == nullptr;
     }
 
-    template<class T>
-    inline std::strong_ordering operator<=>(std::nullptr_t, const tracked_ptr<T>& r) noexcept {
-        return static_cast<decltype(r.get())>(nullptr) <=> r.get();
-    }
-
-    template<class T>
-    inline bool operator==(std::nullptr_t, const tracked_ptr<T>& r) noexcept {
-        return (nullptr <=> r) == 0;
-    }
-
-    template<class T, class U>
-    inline tracked_ptr<T> static_pointer_cast(const tracked_ptr<U>& p) noexcept {
-        return tracked_ptr<T>(static_cast<typename tracked_ptr<T>::element_type*>(p.get()));
-    }
-
-    template<class T, class U>
-    inline tracked_ptr<T> const_pointer_cast(const tracked_ptr<U>& p) noexcept {
-        return tracked_ptr<T>(const_cast<typename tracked_ptr<T>::element_type*>(p.get()));
-    }
-
+    // SPEC.md §3.3.
     template<class T, class U>
     inline tracked_ptr<T> dynamic_pointer_cast(const tracked_ptr<U>& p) noexcept {
-        return tracked_ptr<T>(dynamic_cast<typename tracked_ptr<T>::element_type*>(p.get()));
+        return tracked_ptr<T>(dynamic_cast<T*>(p.get()), typename tracked_ptr<T>::AdoptTag{});
     }
 
-    template<class T>
-    std::ostream& operator<<(std::ostream& s, const tracked_ptr<T>& p) {
-        s << p.get();
-        return s;
-    }
-
-    template<class T>
-    inline void* get_metadata() noexcept {
-        return detail::TypeInfo<T>::user_metadata;
-    }
-
-    template<class T>
-    inline void set_metadata(void* m) noexcept {
-        detail::TypeInfo<T>::user_metadata = m;
+    namespace detail {
+        // Storage-class queries for tests.
+        struct TrackedPtrAccess {
+            template<class T>
+            static bool on_stack(const tracked_ptr<T>& p) noexcept { return p._is_stack(); }
+            template<class T>
+            static bool child(const tracked_ptr<T>& p) noexcept { return p._is_child(); }
+            template<class T>
+            static bool external(const tracked_ptr<T>& p) noexcept { return p._is_external(); }
+        };
     }
 }
 

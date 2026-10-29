@@ -1,0 +1,122 @@
+//------------------------------------------------------------------------------
+// SGCL: Smart Garbage Collection Library
+// Copyright (c) 2022-2025 Sebastian Nibisz
+// SPDX-License-Identifier: Apache-2.0
+//------------------------------------------------------------------------------
+#include "types.h"
+
+// SPEC §3.2, §4.2, §4.10, §5.1: ownership handover, adoption, termination.
+
+using namespace std::chrono_literals;
+
+namespace {
+    struct OwnedTag;
+    using OwnedProbe = Probe<OwnedTag>;
+
+    struct SelfAliasing {
+        tracked_ptr<SelfAliasing> self;
+        OwnedProbe probe{1};
+        SelfAliasing() : self(this) {}
+    };
+
+    std::atomic<long> self_adopting_alive = 0;
+
+    // A vector element that adopts itself while being built into storage that is still owned.
+    struct SelfAdoptingElement {
+        long value;
+        explicit SelfAdoptingElement(long v) : value(v) {
+            adopt();
+        }
+        SelfAdoptingElement(SelfAdoptingElement&& o) noexcept : value(o.value) {
+            adopt();
+        }
+        ~SelfAdoptingElement() {
+            --self_adopting_alive;
+        }
+        void adopt() noexcept {
+            ++self_adopting_alive;
+            tracked_ptr<SelfAdoptingElement> me(this);
+            EXPECT_EQ(me->value, value);
+        }
+    };
+}
+
+// An alias of an object a unique_ptr owns does not hand it over: it is destroyed once, by the reset.
+TEST(Lifecycle_Tests, AliasDoesNotTakeOverUniquePtrOwnership) {
+    ASSERT_TRUE(collect_until([] { return OwnedProbe::alive() == 0; }));
+    auto owned = make_tracked<SelfAliasing>();
+    {
+        tracked_ptr<SelfAliasing> alias = owned->self;
+        tracked_ptr<SelfAliasing> adopted(owned.get());
+        EXPECT_EQ(alias.get(), owned.get());
+        EXPECT_EQ(adopted.get(), owned.get());
+    }
+    settle();
+    settle();
+    EXPECT_EQ(OwnedProbe::alive(), 1);
+    owned.reset();
+    EXPECT_EQ(OwnedProbe::alive(), 0);
+    settle();
+    EXPECT_EQ(OwnedProbe::alive(), 0);
+}
+
+TEST(Lifecycle_Tests, VectorElementAdoptsItselfWhileGrowing) {
+    {
+        vector<SelfAdoptingElement> v;
+        for (long i = 0; i < 100; ++i) {
+            v.emplace_back(i);
+        }
+        settle();
+        ASSERT_EQ(v.size(), 100u);
+        EXPECT_EQ(v[57].value, 57);
+    }
+    EXPECT_TRUE(collect_until([] { return self_adopting_alive.load() == 0; }));
+}
+
+TEST(Lifecycle_Tests, ResizeValueInitializesScalars) {
+    vector<long> v{1, 2, 3, 4, 5, 6, 7, 8};
+    v.clear();
+    v.resize(8);
+    for (auto x : v) {
+        EXPECT_EQ(x, 0);
+    }
+}
+
+namespace {
+    class LifecycleDeathTest : public ::testing::Test {
+    protected:
+        void SetUp() override {
+            GTEST_FLAG_SET(death_test_style, "threadsafe");
+        }
+    };
+}
+
+// terminate() returns although detached threads keep producing garbage.
+TEST_F(LifecycleDeathTest, TerminateIsBoundedUnderSteadyAllocation) {
+    EXPECT_EXIT({
+        for (int t = 0; t < 4; ++t) {
+            std::thread([] {
+                for (;;) {
+                    tracked_ptr<OwnedProbe> p = make_tracked<OwnedProbe>(1);
+                }
+            }).detach();
+        }
+        std::this_thread::sleep_for(100ms);
+        auto start = std::chrono::steady_clock::now();
+        collector::terminate();
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        std::_Exit(elapsed < 20s ? 0 : 1);
+    }, ::testing::ExitedWithCode(0), "");
+}
+
+// terminate() before any collector exists: none ever runs.
+TEST_F(LifecycleDeathTest, TerminateBeforeFirstUseNeverCollects) {
+    EXPECT_EXIT({
+        // The re-executed child has not used SGCL yet when this statement starts only if nothing ran before it;
+        // the flag is set either way, and a running collector stops here too.
+        collector::terminate();
+        { tracked_ptr<OwnedProbe> p = make_tracked<OwnedProbe>(1); }
+        bool collected = collector::force_collect(true);
+        std::_Exit(!collected && OwnedProbe::alive() == 1 ? 0 : 1);
+    }, ::testing::ExitedWithCode(0), "");
+}

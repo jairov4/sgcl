@@ -10,6 +10,7 @@
 #include <memory>
 
 namespace sgcl::detail {
+    // Header of a vector's storage: elements [0, size) are constructed, [size, capacity) are zero (SPEC.md §4.8).
     struct ArrayBase {
         constexpr ArrayBase(size_t s, size_t c) noexcept
         : size(s)
@@ -18,7 +19,8 @@ namespace sgcl::detail {
 
         template<typename T>
         static constexpr auto get_destroy_function() -> void(*)(void*, size_t) noexcept {
-            if constexpr (!std::is_trivially_destructible_v<T> && std::is_destructible_v<T>) {
+            static_assert(std::is_nothrow_destructible_v<T>, "managed types must be nothrow-destructible (SPEC.md §3.4)");
+            if constexpr (!std::is_trivially_destructible_v<T>) {
                 return &_destroy<T>;
             } else {
                 return nullptr;

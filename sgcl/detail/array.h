@@ -9,6 +9,7 @@
 #include "page_info.h"
 
 namespace sgcl::detail {
+    // A size class of vector storage: the header, then `Size` bytes of elements.
     template<size_t Size = 1>
     struct Array : ArrayBase {
         constexpr Array(size_t size, size_t capacity) noexcept
@@ -22,15 +23,13 @@ namespace sgcl::detail {
             }
         }
 
-        char data[Size];
+        alignas(ArrayBase) char data[Size];
     };
 
+    static_assert(sizeof(Array<8>) == sizeof(ArrayBase) + 8, "elements must follow the header directly");
+
+    // Storage larger than a page: one large allocation (SPEC.md §4.1).
     template<>
     struct PageInfo<Array<>> : public PageInfo<Array<PageDataSize>> {
-        using ObjectAllocator = detail::ObjectAllocator<Array<>>;
-
-        static void destroy(void* p) noexcept {
-            std::destroy_at((Array<>*)p);
-        }
     };
 }

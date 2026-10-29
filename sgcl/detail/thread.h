@@ -9,15 +9,11 @@
 #include "object_pool_allocator.h"
 #include "stack_pointer_allocator.h"
 
-#include <cstdio>
-#include <cstdlib>
-#include <thread>
-
-#if SGCL_LOG_PRINT_LEVEL >= 3
-#include <iostream>
-#endif
+#include <array>
+#include <memory>
 
 namespace sgcl::detail {
+    // The part of a thread's record the collector reads; it outlives the thread until the collector drops it.
     struct ThreadData {
         ThreadData(BlockAllocator* b, StackPointerAllocator* s) noexcept
         : block_allocator(b)
@@ -32,79 +28,62 @@ namespace sgcl::detail {
         ThreadData* next_registered = {nullptr};
         std::atomic<Page*> pages = {nullptr};
         Page* last_page_registered = {nullptr};
-        RawPointer hazard_pointer = {nullptr};
     };
 
+    // Trivially destructible: it outlives its own retirement so a late use is diagnosed, not a use-after-free.
     class Thread {
     public:
         using Data = ThreadData;
 
-        struct ChildPointers {
-            uintptr_t base;
-            detail::ChildPointers::Map* map;
+        // The managed allocation whose constructor runs on this thread (SPEC.md §4.3, §4.4).
+        struct Construction {
+            uintptr_t base = 0;
+            size_t size = 0;
+            ChildPointers* layout = nullptr;
         };
 
-        struct ChildGuard {
-            ChildGuard(const ChildGuard&) = delete;
-            void operator=(const ChildGuard&) = delete;
-
-            constexpr ChildGuard(Thread& t, ChildPointers cp) noexcept
-            : thread(t)
-            , old_pointers(t.child_pointers) {
-                thread.child_pointers = cp;
+        class ConstructionGuard {
+        public:
+            ConstructionGuard(Thread& t, Construction c) noexcept
+            : _thread(t)
+            , _previous(t.construction) {
+                _thread.construction = c;
             }
 
-            ~ChildGuard() noexcept {
-                thread.child_pointers = old_pointers;
+            ConstructionGuard(const ConstructionGuard&) = delete;
+            ConstructionGuard& operator=(const ConstructionGuard&) = delete;
+
+            ~ConstructionGuard() noexcept {
+                _thread.construction = _previous;
             }
 
-            Thread& thread;
-            const ChildPointers old_pointers;
+        private:
+            Thread& _thread;
+            const Construction _previous;
         };
 
-        struct RangeGuard {
-            RangeGuard(const RangeGuard&) = delete;
-            void operator=(const RangeGuard&) = delete;
-
-            constexpr RangeGuard(Thread& t, std::pair<uintptr_t, uintptr_t> ar) noexcept
-            : thread(t)
-            , old_alloc_range(t.alloc_range) {
-                thread.alloc_range = ar;
-            }
-
-            ~RangeGuard() noexcept {
-                thread.alloc_range = old_alloc_range;
-            }
-
-            Thread& thread;
-            const std::pair<uintptr_t, uintptr_t> old_alloc_range;
-        };
-
-        Thread()
-        : stack_allocator(new StackPointerAllocator)
-        , _block_allocator(new BlockAllocator)
-        , _data(new Data{_block_allocator, stack_allocator}) {
-#if SGCL_LOG_PRINT_LEVEL >= 3
-            std::cout << "[sgcl] start thread id: " << std::this_thread::get_id() << std::endl;
-#endif
+        explicit Thread(uintptr_t stack_base) noexcept
+        : stack_allocator(checked_new<StackPointerAllocator>(stack_base))
+        , _block_allocator(checked_new<BlockAllocator>())
+        , _data(checked_new<Data>(_block_allocator, stack_allocator)) {
             auto& threads_data = process_state().threads_data;
             _data->next = threads_data.load(std::memory_order_acquire);
             while(!threads_data.compare_exchange_weak(_data->next, _data, std::memory_order_release, std::memory_order_relaxed));
         }
 
-        ~Thread() noexcept {
-            _data->is_deleted.store(true, std::memory_order_release);
-#if !defined(SGCL_EXTERNAL_STATE)
-            if (std::this_thread::get_id() == main_thread_id) {
-                for (auto& a : _allocators) {
-                    a.reset();
-                }
-                terminate_collector();
+        Thread(const Thread&) = delete;
+        Thread& operator=(const Thread&) = delete;
+
+        // At thread exit (the object itself stays, trivially destructible): the pool allocators return their
+        // unused slots, then the record is published as deleted and the collector frees the rest of it. Any later
+        // SGCL use on this thread is fatal (SPEC.md §5.5).
+        void retire() noexcept {
+            for (auto& a : _allocators) {
+                delete a;
+                a = nullptr;
             }
-#endif
-#if SGCL_LOG_PRINT_LEVEL >= 3
-            std::cout << "[sgcl] stop thread id: " << std::this_thread::get_id() << std::endl;
-#endif
+            dead = true;
+            _data->is_deleted.store(true, std::memory_order_release);
         }
 
         template<class T>
@@ -112,50 +91,35 @@ namespace sgcl::detail {
             return _allocator<typename TypeInfo<T>::Allocator>();
         }
 
-        ChildGuard use_child_pointers(ChildPointers cp) noexcept {
-            return {*this, cp};
+        ConstructionGuard use_construction(Construction c) noexcept {
+            return {*this, c};
         }
 
-        RangeGuard use_alloc_range(std::pair<uintptr_t, uintptr_t> ar) noexcept {
-            return {*this, ar};
-        }
-
-        void set_hazard_pointer(void* p) {
-            _data->hazard_pointer.store(p, std::memory_order_release);
-        }
-
-        void clear_hazard_pointer() {
-            _data->hazard_pointer.store(nullptr, std::memory_order_release);
-        }
-
-        ChildPointers child_pointers = {0, nullptr};
+        Construction construction;
         StackPointerAllocator* const stack_allocator;
-#if !defined(SGCL_EXTERNAL_STATE)
-        inline static std::thread::id main_thread_id = {};
-#endif
-        std::pair<uintptr_t, uintptr_t> alloc_range = {0, 0};
+        bool dead = false;
 
     private:
         BlockAllocator* const _block_allocator;
-        std::array<std::unique_ptr<ObjectAllocatorBase>, config::MaxTypesNumber> _allocators;
+        std::array<ObjectAllocatorBase*, config::MaxTypesNumber> _allocators = {};
         Data* const _data;
 
         template<class Allocator>
-        Allocator& _allocator() {
+        Allocator& _allocator() noexcept {
             auto& alocator = _allocators[_type_index<typename Allocator::ValueType>()];
             if (!alocator) {
                 if constexpr(Allocator::IsPoolAllocator::value) {
-                    alocator.reset(new Allocator(*_block_allocator, _data->pages));
+                    alocator = checked_new<Allocator>(*_block_allocator, _data->pages);
                 } else {
-                    alocator.reset(new Allocator(_data->pages));
+                    alocator = checked_new<Allocator>(_data->pages);
                 }
             }
             return static_cast<Allocator&>(*alocator);
         }
-        // Cached per image; the counter is in ProcessState, so under SGCL_EXTERNAL_STATE types of different images
-        // never share a slot.
+
+        // Cached per image; the counter is process-wide, so types of different images never share a slot.
         template<class T>
-        inline static unsigned _type_index() {
+        inline static unsigned _type_index() noexcept {
             static const unsigned index = _next_type_index();
             return index;
         }
@@ -163,35 +127,33 @@ namespace sgcl::detail {
         static unsigned _next_type_index() noexcept {
             auto index = process_state().type_counter.fetch_add(1, std::memory_order_relaxed);
             if (index >= config::MaxTypesNumber) {
-                std::fprintf(stderr, "[sgcl] fatal: more than %zu tracked types; raise SGCL_MAX_TYPES_NUMBER\n",
-                             config::MaxTypesNumber);
-                std::abort();
+                fatal("more managed types than SGCL_MAX_TYPES_NUMBER");
             }
             return index;
         }
     };
 
-#if defined(SGCL_EXTERNAL_STATE)
-    // The Thread lives in the owner's TLS; a pointer to it is cached per image, or shared where the loader merges it.
+    // The Thread lives in the owner's TLS; a pointer to it is cached per image.
     inline Thread& current_thread() noexcept {
         thread_local Thread* thread = nullptr;
         if (!thread) [[unlikely]] {
             thread = &SGCL_STATE_SYMBOL(current_thread)();
         }
+        if (thread->dead) [[unlikely]] {
+            fatal("SGCL used on a thread after its record was retired at thread exit");
+        }
         return *thread;
     }
-#else
-    struct MainThreadDetector {
-        MainThreadDetector() noexcept {
-            Thread::main_thread_id = std::this_thread::get_id();
+}
+
+namespace sgcl::detail {
+    static_assert(std::is_trivially_destructible_v<Thread>);
+
+    // Retires the thread's record when the thread exits.
+    struct ThreadRetirer {
+        Thread& thread;
+        ~ThreadRetirer() noexcept {
+            thread.retire();
         }
     };
-
-    inline static MainThreadDetector main_thread_detector;
-
-    inline Thread& current_thread() noexcept {
-        static thread_local Thread instance;
-        return instance;
-    }
-#endif
 }

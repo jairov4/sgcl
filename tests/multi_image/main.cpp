@@ -3,7 +3,7 @@
 // Copyright (c) 2022-2025 Sebastian Nibisz
 // SPDX-License-Identifier: Apache-2.0
 //------------------------------------------------------------------------------
-// One collector for a process made of several images: `core` owns SGCL's state (SGCL_EXTERNAL_STATE), `a` and `b`
+// One collector for a process made of several images: `core` owns SGCL's state, `a` and `b`
 // are shared libraries that allocate their own types and a shared header-only one, and this executable links all
 // three; it loads a fourth library, `d`, from a worker thread. Prints one PASS/FAIL line per check and returns the
 // number of failures.

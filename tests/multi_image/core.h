@@ -5,8 +5,8 @@
 //------------------------------------------------------------------------------
 #pragma once
 
-// Every image of the multi-image test includes this header first: it selects SGCL_EXTERNAL_STATE and makes `core`,
-// the shared library that defines the state, export it while every other image imports it.
+// Every image of the multi-image test includes this header first: it makes `core`, the shared library that defines
+// the state, export it while every other image imports it.
 #if defined(_WIN32)
 #define MI_EXPORT __declspec(dllexport)
 #define MI_IMPORT __declspec(dllimport)
@@ -21,9 +21,6 @@
 #define MI_API_core MI_IMPORT
 #endif
 
-#if !defined(SGCL_EXTERNAL_STATE)
-#define SGCL_EXTERNAL_STATE
-#endif
 #define SGCL_API MI_API_core
 
 #include "sgcl/sgcl.h"
@@ -46,7 +43,7 @@ namespace mi {
         virtual ~Node() {
             destroyed().fetch_add(1, std::memory_order_relaxed);
         }
-        void natpy_finalize() noexcept {
+        void sgcl_finalize() noexcept {
             if (finalized_once) {
                 refinalized().fetch_add(1, std::memory_order_relaxed);
             }

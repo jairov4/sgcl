@@ -9,6 +9,7 @@
 #include "child_pointers.h"
 
 namespace sgcl::detail {
+    // One per managed type per image; immutable except the collector-only fields at the end.
     struct Metadata {
         template<class T>
         Metadata(T*) noexcept
@@ -18,9 +19,7 @@ namespace sgcl::detail {
         , free(TypeInfo<T>::Allocator::free)
         , object_size(TypeInfo<T>::ObjectSize)
         , object_count(TypeInfo<T>::ObjectCount)
-        , is_array(TypeInfo<T>::IsArray)
-        , user_metadata(TypeInfo<T>::user_metadata)
-        , type_info(typeid(T)) {
+        , is_array(TypeInfo<T>::IsArray) {
         }
 
         ChildPointers& child_pointers;
@@ -30,8 +29,6 @@ namespace sgcl::detail {
         const size_t object_size;
         const unsigned object_count;
         const bool is_array;
-        void*& user_metadata;
-        const std::type_info& type_info;
         Page* empty_page = {nullptr};
         Metadata* next = {nullptr};
         bool used = {false};

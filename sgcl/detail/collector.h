@@ -10,105 +10,119 @@
 #include "types.h"
 
 #include <condition_variable>
-#include <functional>
-
-#if SGCL_LOG_PRINT_LEVEL > 0
-#include <iomanip>
-#include <iostream>
-#endif
+#include <mutex>
+#include <tuple>
 
 namespace sgcl::detail {
+    // The collector thread and its handshakes (SPEC.md §4.6, §4.10).
     class Collector {
-    public:
-        using PauseGuard = std::unique_ptr<std::mutex, std::function<void(std::mutex*)>>;
-
-        Collector() {
-            if (!created()) {
-                process_state().collector_created = true;
-                std::thread([this]{_main_loop();}).detach();
+        struct Resume {
+            void operator()(Collector* c) const noexcept {
+                c->_resume();
             }
+        };
+
+    public:
+        // Keeps the collector paused while a get_live_objects() snapshot is in use.
+        using PauseGuard = std::unique_ptr<Collector, Resume>;
+
+        Collector() noexcept {
+            if (process_state().collector_terminating.load(std::memory_order_acquire)) {
+                _stopped = true;
+            } else {
+                or_fatal([this] {
+                    std::thread([this]{ _main_loop(); }).detach();
+                });
+            }
+            process_state().collector_created.store(true, std::memory_order_release);
         }
 
-        ~Collector() {
-            _terminate();
-        }
+        Collector(const Collector&) = delete;
+        Collector& operator=(const Collector&) = delete;
 
-        void waking_up() {
+        void waking_up() noexcept {
             sleep_flag.store(false, std::memory_order_release);
             sleep_cv.notify_one();
         }
 
         bool force_collect(bool wait) noexcept {
-#if SGCL_LOG_PRINT_LEVEL > 0
-            std::cout << "[sgcl] force collect " << (wait ? "and wait " : "") << "from id: " << std::this_thread::get_id() << std::endl;
-#endif
-            if (wait) {
-                if (!process_state().collector_terminating) {
-                    std::unique_lock<std::mutex> lock(_mutex);
-                    _force_collect();
-                    _cv_data_ready.wait(lock, [this] {
-                        return _dataReady;
-                    });
-                    _dataReady = false;
-                } else {
-                    return false;
-                }
-            } else {
-                _force_collect();
+            if (_on_collector_thread()) {
+                _request(false);
+                return !wait;
             }
-            return true;
+            if (wait && _pause_owner_is_current()) {
+                fatal("force_collect(true) while this thread holds a pause_guard");
+            }
+            std::unique_lock<std::mutex> lock(_mutex);
+            if (_stopped || process_state().collector_terminating.load(std::memory_order_relaxed)) {
+                return false;
+            }
+            auto target = _request_locked(false);
+            if (!wait) {
+                return true;
+            }
+            _cv_done.wait(lock, [&] { return _completed >= target || _stopped; });
+            return _completed >= target;
+        }
+
+        size_t live_object_count() const noexcept {
+            return _last_live_object_count.load(std::memory_order_relaxed);
         }
 
         std::tuple<PauseGuard, std::vector<void*>> get_live_objects() noexcept {
-#if SGCL_LOG_PRINT_LEVEL > 0
-            std::cout << "[sgcl] get live objects from id: " << std::this_thread::get_id() << std::endl;
-            std::flush(std::cout);
-#endif
-            std::unique_lock<std::mutex> lock(_mutex);
-            if (!process_state().collector_terminating) {
-                _live_objects_request = true;
-                _force_collect();
-                _cv_data_ready.wait(lock, [this] {
-                    return _dataReady;
-                });
-                _dataReady = false;
+            if (_on_collector_thread()) {
+                fatal("get_live_objects() on the collector thread");
             }
-            lock.release();
-            return {
-                PauseGuard(&_mutex, [this](std::mutex* mutex) {
-                    _dataProcessed = true;
-                    _cv_data_processed.notify_one();
-                    mutex->unlock();
-
-                })
-              , std::move(_live_objects)
-            };
+            if (_pause_owner_is_current()) {
+                fatal("get_live_objects() while this thread holds a pause_guard");
+            }
+            std::unique_lock<std::mutex> lock(_mutex);
+            std::vector<void*> objects;
+            // One snapshot at a time: the paused cycle belongs to exactly one caller.
+            _cv_done.wait(lock, [&] { return !_snapshot_busy || _stopped; });
+            if (_stopped || process_state().collector_terminating.load(std::memory_order_relaxed)) {
+                return {PauseGuard(nullptr), std::move(objects)};
+            }
+            _snapshot_busy = true;
+            auto target = _request_locked(true);
+            _cv_done.wait(lock, [&] { return _completed >= target || _stopped; });
+            if (_completed >= target && _paused) {
+                objects.swap(_live_objects);
+                _pause_owner.store(std::this_thread::get_id(), std::memory_order_relaxed);
+                return {PauseGuard(this), std::move(objects)};
+            }
+            _snapshot_busy = false;
+            _cv_done.notify_all();
+            return {PauseGuard(nullptr), std::move(objects)};
         }
 
-        void force_short_sleep() {
+        void force_short_sleep() noexcept {
             _short_sleep = true;
         }
 
-        void static terminate() noexcept {
+        static void terminate() noexcept {
             if (created()) {
                 collector_instance()._terminate();
+            } else {
+                // Nothing to stop yet; a collector created later never starts (SPEC.md §4.10).
+                process_state().collector_terminating.store(true, std::memory_order_release);
             }
         }
 
-        inline static bool terminated() noexcept {
-            return process_state().collector_terminating.load();
+        static bool terminated() noexcept {
+            return process_state().collector_terminating.load(std::memory_order_acquire);
         }
 
-        inline static bool created() {
+        static bool created() noexcept {
             return process_state().collector_created.load(std::memory_order_acquire);
         }
 
-        inline std::vector<std::thread>& destroyer_threads() noexcept {
+        std::vector<std::thread>& destroyer_threads() noexcept {
             return _destroyer_threads;
         }
 
-        inline static void delete_unique(const void* p) noexcept {
-            assert(p != nullptr);
+        // unique_ptr's deleter: destroy now, on the calling thread; a later cycle reclaims the slot.
+        static void delete_unique(const void* p) noexcept {
             auto page = Page::page_of(p);
             auto ptr = Page::base_address_of(p);
             _destroy(page, ptr, false);
@@ -116,22 +130,45 @@ namespace sgcl::detail {
         }
 
     private:
-        inline static void _update_child_offsets(ChildPointers& childs) {
-            if (!childs.offsets && childs.final.load(std::memory_order_acquire)) {
-                childs.offsets.reset(new ChildPointers::Vector);
-                for (unsigned index = 0; index < childs.map.size(); ++index) {
-                    auto flags = childs.map[index].load(std::memory_order_relaxed);
-                    while(flags) {
-                        auto i = std::countr_zero(flags);
-                        auto offset = index * 8 + i;
-                        childs.offsets->emplace_back(offset);
-                        flags &= flags - 1;
-                    };
-                }
-            }
+        // A word read at a child offset is traced only when it points into a live page (SPEC.md §4.4): zero is
+        // null, 1 is the discovery sentinel, a tagged value is the ref of a non-child tracked_ptr, and anything
+        // else may be foreign data sharing the offset in type-erased storage.
+        static bool _is_referent(const void* p) noexcept {
+            return (uintptr_t)p > 1 && process_state().pages.contains(p);
         }
 
-        void _register_threads() {
+        bool _on_collector_thread() const noexcept {
+            return std::this_thread::get_id() == _thread_id.load(std::memory_order_relaxed);
+        }
+
+        bool _pause_owner_is_current() const noexcept {
+            return std::this_thread::get_id() == _pause_owner.load(std::memory_order_relaxed);
+        }
+
+        void _request(bool live_objects) noexcept {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _request_locked(live_objects);
+        }
+
+        uint64_t _request_locked(bool live_objects) noexcept {
+            auto target = ++_requested;
+            if (live_objects) {
+                _snapshot_target = target;
+            }
+            waking_up();
+            return target;
+        }
+
+        void _resume() noexcept {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _pause_owner.store(std::thread::id(), std::memory_order_relaxed);
+            _paused = false;
+            _snapshot_busy = false;
+            _cv_resume.notify_all();
+            _cv_done.notify_all();
+        }
+
+        void _register_threads() noexcept {
             auto first_thread = process_state().threads_data.load(std::memory_order_acquire);
             auto thread = first_thread;
             while(thread != _last_thread_registered) {
@@ -140,7 +177,7 @@ namespace sgcl::detail {
                 thread = thread->next;
             }
             if (_last_thread_registered != first_thread) {
-                // To avoid ABA
+                // The newest record stays as a sentinel against ABA on the push-only list.
                 if (_last_thread_registered) {
                     _last_thread_registered->is_last_registered = false;
                     if (!_last_thread_registered->is_used) {
@@ -151,17 +188,9 @@ namespace sgcl::detail {
                 _last_thread_registered = first_thread;
                 _last_thread_registered->is_last_registered = true;
             }
-
-            if (process_state().collector_terminating) {
-                process_state().threads_data.store(nullptr, std::memory_order_relaxed);
-                if (_last_thread_registered) {
-                    _last_thread_registered->is_last_registered = false;
-                }
-                _last_thread_registered = nullptr;
-            }
         }
 
-        void _register_pages() {
+        void _register_pages() noexcept {
             bool delete_thread = false;
             Thread::Data* prev = nullptr;
             auto thread = _registered_threads;
@@ -175,7 +204,6 @@ namespace sgcl::detail {
                     } else {
                         prev->next_registered = next;
                     }
-                    // To avoid ABA
                     if (!thread->is_last_registered) {
                         delete thread;
                         delete_thread = true;
@@ -192,7 +220,7 @@ namespace sgcl::detail {
             }
         }
 
-        void _register_pages(std::atomic<Page*>& pages, Page*& last_page_registered, bool thread_deleted) {
+        void _register_pages(std::atomic<Page*>& pages, Page*& last_page_registered, bool thread_deleted) noexcept {
             auto first_page = pages.load(std::memory_order_acquire);
             auto page = first_page;
             while(page != last_page_registered) {
@@ -208,7 +236,6 @@ namespace sgcl::detail {
                     }
                 }
             } else if (last_page_registered != first_page) {
-                // To avoid ABA
                 if (last_page_registered) {
                     last_page_registered->is_last_registered = false;
                     if (!last_page_registered->is_used) {
@@ -220,92 +247,71 @@ namespace sgcl::detail {
             }
         }
 
-        size_t _register_objects() noexcept {
-            size_t objects_created = 0;
-            auto page = _registered_pages;
-            while(page) {
-                auto next = page->next_registered;
-                if (page->is_used) {
-                    if (page->object_created.load(std::memory_order_acquire)) {
-                        page->object_created.store(false, std::memory_order_relaxed);
-                        auto states = page->states();
-                        auto flags = page->flags();
-                        auto count = page->flags_count();
-                        for (unsigned i = 0; i < count; ++i) {
-                            auto& flag = flags[i];
-                            auto unregistered = ~flag.registered;
-                            auto offset = i * Page::FlagBitCount;
-                            auto object_count = page->metadata->object_count;
-                            bool last = (i == count - 1);
-                            while(unregistered) {
-                                auto countr_zero = std::countr_zero(unregistered);
-                                auto index = offset + countr_zero;
-                                if (!last || index < object_count) {
-                                    auto state = states[index].load(std::memory_order_relaxed);
-                                    if (state & State::CreatedMask) {
-                                        auto mask = Page::Flag(1) << countr_zero;
-                                        flag.registered |= mask;
-                                        if (state == State::Reachable) {
-                                            page->state_updated.store(true, std::memory_order_relaxed);
-                                        }
-                                        ++objects_created;
-                                    }
-                                }
-                                unregistered &= unregistered - 1;
-                            }
-                        }
-                    }
+        void _register_objects() noexcept {
+            for (auto page = _registered_pages; page; page = page->next_registered) {
+                if (!page->is_used || !page->object_created.exchange(false, std::memory_order_acquire)) {
+                    continue;
                 }
-                page = next;
-            }
-            return objects_created;
-        }
-
-        void _update_states() {
-            auto page = _registered_pages;
-            while(page) {
-                page->clear_flags();
-                if (page->state_updated.load(std::memory_order_acquire)) {
-                    page->state_updated.store(false, std::memory_order_relaxed);
-                    auto states = page->states();
-                    auto flags = page->flags();
-                    auto count = page->flags_count();
-                    for (unsigned i = 0; i < count; ++i) {
-                        auto registered = flags[i].registered;
-                        auto offset = i * Page::FlagBitCount;
-                        while(registered) {
-                            auto index = offset + std::countr_zero(registered);
-                            auto state = states[index].load(std::memory_order_relaxed);
+                auto states = page->states();
+                auto flags = page->flags();
+                auto count = page->flags_count();
+                auto object_count = page->metadata->object_count;
+                for (unsigned i = 0; i < count; ++i) {
+                    auto& flag = flags[i];
+                    auto unregistered = ~flag.registered;
+                    auto offset = i * Page::FlagBitCount;
+                    while(unregistered) {
+                        auto countr_zero = std::countr_zero(unregistered);
+                        auto index = offset + countr_zero;
+                        if (index >= object_count) {
+                            break;
+                        }
+                        auto state = states[index].load(std::memory_order_relaxed);
+                        if (state & State::CreatedMask) {
+                            flag.registered |= Page::Flag(1) << countr_zero;
                             if (state == State::Reachable) {
-                                states[index].store(State::Used, std::memory_order_relaxed);
+                                page->state_updated.store(true, std::memory_order_relaxed);
                             }
-                            registered &= registered - 1;
                         }
+                        unregistered &= unregistered - 1;
                     }
                 }
-                page = page->next_registered;
             }
         }
 
-        void _update_hazard_pointers() {
-            decltype(_hazard_pointers)().swap(_hazard_pointers);
-            auto thread = _registered_threads;
-            while(thread) {
-                auto pointer = thread->hazard_pointer.load(std::memory_order_relaxed);
-                if (pointer) {
-                    _hazard_pointers.emplace_back((uintptr_t)pointer);
+        void _update_states() noexcept {
+            for (auto page = _registered_pages; page; page = page->next_registered) {
+                page->clear_flags();
+                if (!page->state_updated.exchange(false, std::memory_order_acquire)) {
+                    continue;
                 }
-                thread = thread->next_registered;
+                auto states = page->states();
+                auto flags = page->flags();
+                auto count = page->flags_count();
+                for (unsigned i = 0; i < count; ++i) {
+                    auto registered = flags[i].registered;
+                    auto offset = i * Page::FlagBitCount;
+                    while(registered) {
+                        auto index = offset + std::countr_zero(registered);
+                        auto& state = states[index];
+                        auto expected = State::Reachable;
+                        // Never overwrites a handover or a destruction; acq_rel pairs with the barrier's RMW.
+                        state.compare_exchange_strong(expected, State::Used, std::memory_order_acq_rel, std::memory_order_relaxed);
+                        registered &= registered - 1;
+                    }
+                }
             }
-            std::sort(_hazard_pointers.begin(), _hazard_pointers.end());
         }
 
         void _mark(const void* ptr) noexcept {
             auto page = Page::page_of(ptr);
             auto index = page->index_of(ptr);
-            auto flag_index = Page::flag_index_of(index);
+            // A foreign value inside a live page may fall past its last slot or on its header word.
+            if (index >= page->metadata->object_count) {
+                return;
+            }
             auto mask = Page::flag_mask_of(index);
-            auto& flag = page->flags()[flag_index];
+            auto& flag = page->flags()[Page::flag_index_of(index)];
             if ((flag.registered & ~flag.marked & ~flag.reachable & mask)) {
                 flag.reachable |= mask;
                 if (!page->reachable) {
@@ -317,82 +323,45 @@ namespace sgcl::detail {
         }
 
         void _mark_stack_roots() noexcept {
-            auto thread = _registered_threads;
-            while(thread) {
-                if (!thread->is_deleted.load(std::memory_order_acquire)) {
-                    auto& allocator = *thread->stack_roots_allocator;
-                    for (size_t i = 0; i < std::size(allocator.is_used); ++i) {
-                        auto used = allocator.is_used[i].load(std::memory_order_acquire);
-                        if (used) {
-                            auto first = i * (StackPointerAllocator::PageSize / sizeof(RawPointer));
-                            auto last = first + (StackPointerAllocator::PageSize / sizeof(RawPointer));
-                            for (size_t index = first; index < last; ++index) {
-                                auto p = allocator.data[index].load(std::memory_order_acquire);
-                                if (p) {
-                                    _mark(p);
-                                }
-                            }
+            for (auto thread = _registered_threads; thread; thread = thread->next_registered) {
+                if (thread->is_deleted.load(std::memory_order_acquire)) {
+                    continue;
+                }
+                auto& allocator = *thread->stack_roots_allocator;
+                for (size_t i = 0; i < std::size(allocator.is_used); ++i) {
+                    if (!allocator.is_used[i].load(std::memory_order_acquire)) {
+                        continue;
+                    }
+                    auto first = i * (StackPointerAllocator::PageSize / sizeof(RawPointer));
+                    auto last = first + (StackPointerAllocator::PageSize / sizeof(RawPointer));
+                    for (size_t index = first; index < last; ++index) {
+                        if (auto p = allocator.data[index].load(std::memory_order_acquire)) {
+                            _mark(p);
                         }
                     }
                 }
-                thread = thread->next_registered;
             }
         }
 
-        void _mark_childs(void* ptr, const ChildPointers::Vector& offsets) noexcept {
-            for (auto offset : offsets) {
-                auto ap = (RawPointer*)ptr + offset;
-                auto p = ap->load(std::memory_order_acquire);
-                if ((size_t)p > 1) {
+        void _mark_childs(void* ptr, const ChildPointers& layout) noexcept {
+            layout.for_each([&](size_t word) {
+                auto p = ((RawPointer*)ptr + word)->load(std::memory_order_acquire);
+                if (_is_referent(p)) {
                     _mark(p);
                 }
-            }
-        }
-
-        void _mark_childs(void* ptr, const ChildPointers::Map& map) noexcept {
-            for (unsigned index = 0; index < map.size(); ++index) {
-                auto flags = map[index].load(std::memory_order_relaxed);
-                while(flags) {
-                    auto i = std::countr_zero(flags);
-                    auto offset = index * 8 + i;
-                    auto ap = (RawPointer*)ptr + offset;
-                    auto p = ap->load(std::memory_order_acquire);
-                    if ((size_t)p > 1) {
-                        _mark(p);
-                    }
-                    flags &= flags - 1;
-                };
-            }
+            });
         }
 
         void _mark_array_childs(void* ptr) noexcept {
-            auto data = (uintptr_t)ptr;
-            auto array = (ArrayBase*)data;
-            auto metadata = array->metadata.load(std::memory_order_relaxed);
-            if (metadata) {
-                auto& pointers = metadata->child_pointers;
-                _update_child_offsets(pointers);
-                data += sizeof(ArrayBase);
-                auto object_size = metadata->object_size;
-                if (pointers.offsets) {
-                    if (pointers.offsets->size()) {
-                        for (size_t i = 0; i < array->capacity; ++i, data += object_size) {
-                            _mark_childs((void*)data, *pointers.offsets);
-                        }
-                    }
-                } else {
-                    for (size_t i = 0; i < array->capacity; ++i, data += object_size) {
-                        _mark_childs((void*)data, pointers.map);
-                    }
-                }
+            auto array = (ArrayBase*)ptr;
+            auto metadata = array->metadata.load(std::memory_order_acquire);
+            if (!metadata || !metadata->child_pointers.size) {
+                return;
             }
-        }
-
-        void _mark_childs(ChildPointers& pointers, void* ptr) noexcept {
-            if (pointers.offsets) {
-                _mark_childs(ptr, *pointers.offsets);
-            } else {
-                _mark_childs(ptr, pointers.map);
+            // Every element up to capacity: [size, capacity) is zero (SPEC.md §4.8).
+            auto data = (uintptr_t)(array + 1);
+            for (size_t i = 0; i < array->capacity; ++i, data += metadata->object_size) {
+                _mark_childs((void*)data, metadata->child_pointers);
             }
         }
 
@@ -401,7 +370,6 @@ namespace sgcl::detail {
             _reachable_pages = nullptr;
             while(page) {
                 auto metadata = page->metadata;
-                _update_child_offsets(metadata->child_pointers);
                 const bool is_array = metadata->is_array;
                 auto flags = page->flags();
                 auto count = page->flags_count();
@@ -415,18 +383,16 @@ namespace sgcl::detail {
                             auto offset = i * Page::FlagBitCount;
                             while(reachable) {
                                 auto countr_zero = std::countr_zero(reachable);
-                                auto mask = Page::Flag(1) << countr_zero;
-                                flag.marked |= mask;
-                                auto index = offset + countr_zero;
-                                auto ptr = page->pointer_of(index);
+                                flag.marked |= Page::Flag(1) << countr_zero;
+                                auto ptr = page->pointer_of(offset + countr_zero);
                                 if (is_array) {
                                     _mark_array_childs(ptr);
                                 } else {
-                                    _mark_childs(metadata->child_pointers, ptr);
+                                    _mark_childs(ptr, metadata->child_pointers);
                                 }
                                 ++_live_object_count;
                                 if (_share_live_objects) {
-                                    _live_objects.emplace_back(ptr);
+                                    _live_objects.push_back(ptr);
                                 }
                                 reachable &= reachable - 1;
                             }
@@ -444,15 +410,16 @@ namespace sgcl::detail {
             }
         }
 
+        // Grays registered, unmarked slots whose state is protected. With All, every registered page is scanned
+        // and pages keeping unmarked, unprotected slots go on the unreachable list; otherwise only unreachable
+        // pages that saw a state change.
         template<bool All>
         void _mark_updated() noexcept {
             auto page = All ? _registered_pages : _unreachable_pages;
             while(page) {
                 bool reachable_page = false;
                 [[maybe_unused]] bool unreachable_page = false;
-                // always acquire-load, even when All short-circuits the branch: this is what
-                // synchronizes-with a mutator's state_updated release store so the states[] reads
-                // below observe a freshly-published Reachable transition, not a stale value.
+                // Always acquire: it orders the state reads below after a mutator's barrier.
                 auto state_updated = page->state_updated.load(std::memory_order_acquire);
                 if (All || state_updated) {
                     auto states = page->states();
@@ -464,30 +431,14 @@ namespace sgcl::detail {
                         auto offset = i * Page::FlagBitCount;
                         while(unreachable) {
                             auto countr_zero = std::countr_zero(unreachable);
-                            auto index = offset + countr_zero;
-                            auto state = states[index].load(std::memory_order_relaxed);
+                            auto state = states[offset + countr_zero].load(std::memory_order_relaxed);
                             if (state & State::ReachableMask) {
-                                auto mask = Page::Flag(1) << countr_zero;
-                                flag.reachable |= mask;
+                                flag.reachable |= Page::Flag(1) << countr_zero;
                                 reachable_page = true;
                             } else if constexpr(All) {
                                 unreachable_page = true;
                             }
                             unreachable &= unreachable - 1;
-                        }
-                    }
-                }
-                if constexpr(All) {
-                    if (_hazard_pointers.size()) {
-                        auto lower = std::lower_bound(_hazard_pointers.begin(), _hazard_pointers.end(), page->data);
-                        auto upper = std::lower_bound(lower, _hazard_pointers.end(), page->data + PageDataSize);
-                        for (auto i = lower; i != upper; ++i) {
-                            auto index = page->index_of((void*)*i);
-                            auto flag_index = Page::flag_index_of(index);
-                            auto mask = Page::flag_mask_of(index);
-                            auto& flag = page->flags()[flag_index];
-                            flag.reachable |= mask;
-                            reachable_page = true;
                         }
                     }
                 }
@@ -509,80 +460,51 @@ namespace sgcl::detail {
             }
         }
 
-        inline static void _clear_childs(void* ptr, const ChildPointers::Vector& offsets) noexcept {
-            for (auto offset : offsets) {
-                auto p = (RawPointer*)ptr + offset;
-                p->store(nullptr, std::memory_order_relaxed);
-            }
-        }
-
-        inline static void _clear_childs(void* ptr, const ChildPointers::Map& map) noexcept {
-            for (unsigned index = 0; index < map.size(); ++index) {
-                auto flags = map[index].load(std::memory_order_relaxed);
-                while(flags) {
-                    auto i = std::countr_zero(flags);
-                    auto offset = index * 8 + i;
-                    auto p = (RawPointer*)ptr + offset;
-                    p->store(nullptr, std::memory_order_relaxed);
-                    flags &= flags - 1;
-                };
-            }
-        }
-
-        inline static void _clear_childs(ChildPointers& childs, void* ptr) noexcept {
-            if (childs.offsets) {
-                _clear_childs(ptr, *childs.offsets);
-            } else {
-                _clear_childs(ptr, childs.map);
-            }
-        }
-
-        inline static void _clear_array_childs(void* ptr) noexcept {
-            auto data = (uintptr_t)ptr;
-            auto array = (ArrayBase*)data;
-            auto metadata = array->metadata.load(std::memory_order_relaxed);
-            if (metadata) {
-                auto& pointers = metadata->child_pointers;
-                _update_child_offsets(pointers);
-                data += sizeof(ArrayBase);
-                auto object_size = metadata->object_size;
-                if (pointers.offsets) {
-                    if (pointers.offsets->size()) {
-                        for (size_t i = 0; i < array->size; ++i, data += object_size) {
-                            _clear_childs((void*)data, *pointers.offsets);
-                        }
-                    }
-                } else {
-                    for (size_t i = 0; i < array->size; ++i, data += object_size) {
-                        _clear_childs((void*)data, pointers.map);
-                    }
+        // Only words holding a referent: a foreign value sharing the offset stays as its owner left it.
+        static void _clear_childs(void* ptr, const ChildPointers& layout) noexcept {
+            layout.for_each([&](size_t word) {
+                auto cell = (RawPointer*)ptr + word;
+                if (_is_referent(cell->load(std::memory_order_relaxed))) {
+                    cell->store(nullptr, std::memory_order_relaxed);
                 }
+            });
+        }
+
+        static void _clear_array_childs(ArrayBase* array, ArrayMetadata* metadata) noexcept {
+            if (!metadata->child_pointers.size) {
+                return;
+            }
+            auto data = (uintptr_t)(array + 1);
+            for (size_t i = 0; i < array->size; ++i, data += metadata->object_size) {
+                _clear_childs((void*)data, metadata->child_pointers);
             }
         }
 
-        inline static void _destroy(Page* page, void* ptr, bool clear_childs) noexcept {
+        // With clear_childs, the children are nulled first so the destructor touches no other dead object.
+        static void _destroy(Page* page, void* ptr, bool clear_childs) noexcept {
             auto destroy = page->metadata->destroy;
-            if (destroy) {
-                if (!page->metadata->is_array) {
+            if (!destroy) {
+                return;
+            }
+            if (!page->metadata->is_array) {
+                if (clear_childs) {
+                    _clear_childs(ptr, page->metadata->child_pointers);
+                }
+                destroy(ptr);
+            } else {
+                auto array = (ArrayBase*)ptr;
+                auto metadata = array->metadata.load(std::memory_order_acquire);
+                if (metadata && !metadata->tracked_ptrs_only) {
                     if (clear_childs) {
-                        _clear_childs(page->metadata->child_pointers, ptr);
+                        _clear_array_childs(array, metadata);
                     }
                     destroy(ptr);
-                } else {
-                    auto array = (ArrayBase*)ptr;
-                    auto metadata = array->metadata.load(std::memory_order_relaxed);
-                    if (metadata && !metadata->tracked_ptrs_only) {
-                        if (clear_childs) {
-                            _clear_array_childs(ptr);
-                        }
-                        destroy(ptr);
-                    }
                 }
             }
         }
 
-        // Runs every unreachable object's finalizer before any object's children are cleared or destroyed, so a
-        // finalizer reads a fully intact object graph (the Python __del__ contract) even when its children are garbage too.
+        // SPEC.md §4.7: every hook of the cycle runs before any child is nulled or destructor runs, at most once
+        // per allocation.
         void _finalize_garbage() noexcept {
             for (auto page = _unreachable_pages; page; page = page->next_unreachable) {
                 auto finalize = page->metadata->finalize;
@@ -593,24 +515,25 @@ namespace sgcl::detail {
                 auto flags = page->flags();
                 auto count = page->flags_count();
                 for (unsigned i = 0; i < count; ++i) {
-                    auto unreachable = flags[i].registered & ~flags[i].marked;
+                    auto& flag = flags[i];
+                    auto candidates = flag.registered & ~flag.marked & ~flag.finalized;
                     auto offset = i * Page::FlagBitCount;
-                    while (unreachable) {
-                        auto index = offset + std::countr_zero(unreachable);
+                    while (candidates) {
+                        auto countr_zero = std::countr_zero(candidates);
+                        auto index = offset + countr_zero;
                         if (states[index].load(std::memory_order_relaxed) == State::Unreachable) {
+                            flag.finalized |= Page::Flag(1) << countr_zero;
                             finalize(page->pointer_of(index));
                         }
-                        unreachable &= unreachable - 1;
+                        candidates &= candidates - 1;
                     }
                 }
             }
         }
 
         size_t _remove_garbage() noexcept {
-            std::atomic_thread_fence(std::memory_order_acquire);
             _finalize_garbage();
-            // A finalizer that reads a child re-stores its pointer (-> Reachable); keep those objects and everything
-            // they reach for this cycle, else their own children would be destroyed under them.
+            // Keep what the hooks made reachable again, and everything it reaches, for this cycle.
             _mark_updated<false>();
             while (_reachable_pages) {
                 _mark_reachable();
@@ -620,92 +543,76 @@ namespace sgcl::detail {
             auto page = _unreachable_pages;
             _unreachable_pages = nullptr;
             while(page) {
-                _update_child_offsets(page->metadata->child_pointers);
                 auto states = page->states();
                 auto flags = page->flags();
                 auto count = page->flags_count();
+                // acquire: the states read below are at least as new as the last barrier on this page.
+                page->state_updated.load(std::memory_order_acquire);
                 for (unsigned i = 0; i < count; ++i) {
                     auto& flag = flags[i];
                     auto unreachable = flag.registered & ~flag.marked;
                     auto offset = i * Page::FlagBitCount;
                     if (unreachable) {
                         page->unused_occur.store(true, std::memory_order_relaxed);
-                        do {
-                            auto countr_zero = std::countr_zero(unreachable);
-                            auto index = offset + countr_zero;
-                            auto mask = Page::Flag(1) << countr_zero;
-                            auto state = states[index].load(std::memory_order_relaxed);
-                            // A slot can still show Reachable/UniqueLock/Constructing here despite
-                            // being computed as (registered & ~marked): the state transition that
-                            // should have kept it out of _unreachable_pages (via _mark_updated
-                            // re-scanning the page) can lose a race against this slot's own
-                            // registration/publication. This is defense in depth against destroying a
-                            // live or mid-construction object -- leave it alone and let the next cycle
-                            // re-evaluate it, instead of destroying/reusing memory a mutator may still
-                            // be initializing.
-                            if (state & State::ReachableMask) {
-                                flag.marked |= mask;
-                                unreachable &= unreachable - 1;
-                                continue;
-                            }
-                            if (state == State::Unreachable) {
-                                _destroy(page, page->pointer_of(index), true);
-                            }
-                            ++removed;
-                            // release: publishes this slot's destructor call above (and every
-                            // other write sequenced before it) to whichever thread's fill()
-                            // acquire-reads State::Unused off this page to reuse the memory.
-                            states[index].store(State::Unused, std::memory_order_release);
-                            ++page->unused_counter_gc;
-                            unreachable &= unreachable - 1;
-                        } while(unreachable);
+                    }
+                    while (unreachable) {
+                        auto countr_zero = std::countr_zero(unreachable);
+                        auto index = offset + countr_zero;
+                        auto mask = Page::Flag(1) << countr_zero;
+                        auto state = states[index].load(std::memory_order_relaxed);
+                        unreachable &= unreachable - 1;
+                        // Defence in depth: a protected slot is never destroyed; the next cycle decides.
+                        if (state & State::ReachableMask) {
+                            flag.marked |= mask;
+                            continue;
+                        }
+                        if (state == State::Unreachable) {
+                            _destroy(page, page->pointer_of(index), true);
+                        }
+                        ++removed;
+                        flag.finalized &= ~mask;
+                        // release: publishes the destruction to the fill() that reuses the slot.
+                        states[index].store(State::Unused, std::memory_order_release);
+                        ++page->unused_counter_gc;
                     }
                     flag.registered &= flag.marked;
                 }
                 page->unreachable = false;
                 page = page->next_unreachable;
             }
-
             return removed;
         }
 
-        void _release_unused_pages() {
+        void _release_unused_pages() noexcept {
             Metadata* metadata = nullptr;
-            auto page = _registered_pages;
-            while(page) {
-                if (page->unused_occur.load(std::memory_order_relaxed)) {
-                    // acquire: pairs with a mutator's release store when it takes this page off
-                    // the empty list (object_pool_allocator_base.h's alloc()), so this doesn't
-                    // stay stuck thinking the page is still parked there.
-                    if (!page->on_empty_list.load(std::memory_order_acquire)) {
-                        auto count = page->metadata->object_count;
-                        auto unused = page->unused_counter_gc;
-                        // acquire: pairs with the release fetch_add/fetch_sub on this counter
-                        // from mutators freeing objects (object_pool_allocator_base.h), so the
-                        // freed count -- and everything sequenced before it, e.g. destructors --
-                        // is visible before this page can be handed back for reuse below.
-                        unused += page->unused_atomic.load(std::memory_order_acquire);
-                        unused -= page->unused_counter_mutators;
-                        if (unused > count / 2) {
-                            page->unused_occur.store(false, std::memory_order_relaxed);
-                            if (!page->metadata->used) {
-                                page->metadata->used = true;
-                                page->metadata->next = metadata;
-                                metadata = page->metadata;
-                            }
-                            page->on_empty_list.store(true, std::memory_order_relaxed);
-                            page->next_empty = page->metadata->empty_page;
-                            page->metadata->empty_page = page;
-                        }
-                    }
+            for (auto page = _registered_pages; page; page = page->next_registered) {
+                if (!page->unused_occur.load(std::memory_order_relaxed)) {
+                    continue;
                 }
-                page = page->next_registered;
+                // acquire: pairs with alloc()'s release store when it took the page off the buffer, which
+                // publishes its unused_counter_mutators.
+                if (page->on_empty_list.load(std::memory_order_acquire)) {
+                    continue;
+                }
+                auto count = page->metadata->object_count;
+                auto unused = page->unused_counter_gc;
+                // acquire: pairs with the release fetch_add of slots returned at thread exit.
+                unused += page->unused_atomic.load(std::memory_order_acquire);
+                unused -= page->unused_counter_mutators;
+                if (unused > count / 2) {
+                    page->unused_occur.store(false, std::memory_order_relaxed);
+                    if (!page->metadata->used) {
+                        page->metadata->used = true;
+                        page->metadata->next = metadata;
+                        metadata = page->metadata;
+                    }
+                    page->on_empty_list.store(true, std::memory_order_relaxed);
+                    page->next_empty = page->metadata->empty_page;
+                    page->metadata->empty_page = page;
+                }
             }
 
-            for (auto& thread: destroyer_threads()) {
-                thread.join();
-            }
-            destroyer_threads().clear();
+            _join_destroyer_threads();
 
             bool possible_empty_blocks = metadata != nullptr;
             while(metadata) {
@@ -717,215 +624,189 @@ namespace sgcl::detail {
             if (possible_empty_blocks) {
                 BlockAllocator::release_empty();
             }
-            std::vector<Page*> pages_to_delete;
-            Page* prev = nullptr;
-            page = _registered_pages;
-            while(page) {
-                auto next = page->next_registered;
-                if (!page->is_used) {
-                    if (!prev) {
-                        _registered_pages = next;
+            or_fatal([this] {
+                std::vector<Page*> pages_to_delete;
+                Page* prev = nullptr;
+                auto page = _registered_pages;
+                while(page) {
+                    auto next = page->next_registered;
+                    if (!page->is_used) {
+                        if (!prev) {
+                            _registered_pages = next;
+                        } else {
+                            prev->next_registered = next;
+                        }
+                        if (!page->is_last_registered) {
+                            pages_to_delete.push_back(page);
+                        }
                     } else {
-                        prev->next_registered = next;
+                        prev = page;
                     }
-                    // To avoid ABA
-                    if (!page->is_last_registered) {
-                        pages_to_delete.push_back(page);
-                    }
-                } else {
-                    prev = page;
+                    page = next;
                 }
-                page = next;
-            }
-            if (pages_to_delete.size()) {
-                destroyer_threads().emplace_back(
-                    std::thread([pages = std::move(pages_to_delete)] {
+                if (pages_to_delete.size()) {
+                    destroyer_threads().emplace_back([pages = std::move(pages_to_delete)] {
                         for (auto page: pages) {
                             delete page;
                         }
-                    })
-                );
-            }
-        }
-
-#if SGCL_LOG_PRINT_LEVEL >= 2
-        double total_time = 0;
-#endif
-        void _main_loop() noexcept {
-#if SGCL_LOG_PRINT_LEVEL > 0
-            std::cout << "[sgcl] start collector id: " << std::this_thread::get_id() << std::endl;
-#endif
-            using namespace std::chrono_literals;
-            int finalization_counter = 5;
-            Counter last_mem_allocated;
-            do {
-#if SGCL_LOG_PRINT_LEVEL >= 2
-                auto start = std::chrono::high_resolution_clock::now();
-#endif
-                _register_threads();
-                _register_pages();
-                [[maybe_unused]] size_t last_objects_created = _register_objects();
-                _update_states();
-                _mark_stack_roots();
-                _live_object_count = 0;
-                do {
-                    _mark_reachable();
-                    if (!_unreachable_pages) {
-                        _register_threads();
-                        _register_pages();
-                        last_objects_created += _register_objects();
-                        _update_hazard_pointers();
-                        _mark_updated<true>();
-                    } else {
-                        _mark_updated<false>();
-                    }
-                } while(_reachable_pages);
-                _last_live_object_count.store(_live_object_count, std::memory_order_relaxed);
-                size_t last_objects_removed = _remove_garbage();
-                _release_unused_pages();
-#if SGCL_LOG_PRINT_LEVEL >= 2
-                auto end = std::chrono::high_resolution_clock::now();
-                double duration = std::chrono::duration<double, std::milli>(end - start).count();
-                total_time += duration;
-                std::cout << "[sgcl] mem allocs:" << std::setw(7) << MemoryCounters::alloc_counter().count + last_mem_allocated.count
-                          << ",    mem removed:" << std::setw(7) << MemoryCounters::free_counter().count
-                          << ",    total mem:" << std::setw(7) << MemoryCounters::live_counter().count
-                          << ",    objects created:" << std::setw(9) << last_objects_created
-                          << ",    objects removed:" << std::setw(9) << last_objects_removed
-                          << ",    live objects:" << std::setw(9) << _live_object_count
-                          << ",    time:" << std::setw(8) << std::fixed << std::setprecision(3) << duration << "ms"
-                          << ",    total time:" << std::setw(10) << std::fixed << std::setprecision(3) << total_time << "ms"
-                          << std::endl;
-#endif
-                bool can_sleep = true;
-                if (_forced_collect_count.load(std::memory_order_acquire)) {
-                    if (_forced_collect_count.fetch_sub(1, std::memory_order_relaxed) == 1) {
-                        {
-                            std::unique_lock<std::mutex> lock(_mutex);
-                            _dataReady = true;
-                            _cv_data_ready.notify_all();
-                        }
-                        if (_share_live_objects) {
-                            std::unique_lock<std::mutex> lock(_mutex);
-#if SGCL_LOG_PRINT_LEVEL > 2
-                            std::cout << "[sgcl] suspended collector id: " << std::this_thread::get_id() << std::endl;
-#endif
-                            _cv_data_processed.wait(lock, [this] {
-                                return _dataProcessed;
-                            });
-                            _dataProcessed = false;
-                            _share_live_objects = false;
-#if SGCL_LOG_PRINT_LEVEL > 2
-                            std::cout << "[sgcl] resumed collector id: " << std::this_thread::get_id() << std::endl;
-#endif
-                        }
-                    }
-                    else {
-                        if (_forced_collect_count.load(std::memory_order_relaxed) == 1) {
-                            assert(_live_objects.size() == 0);
-                            if (_live_objects_request) {
-                                _live_objects_request = false;
-                                _share_live_objects = true;
-                            }
-                        }
-                        can_sleep = false;
-                    }
-                }
-                if (!process_state().collector_terminating && can_sleep) {
-                    sleep_flag.store(true, std::memory_order_relaxed);
-                    std::unique_lock<std::mutex> lock(_mutex);
-                    auto sleep_time = _short_sleep ? config::ShortSleepTime : config::LongSleepTime;
-                    _short_sleep = false;
-                    sleep_cv.wait_for(lock, sleep_time, [this]{
-                        return !sleep_flag.load(std::memory_order_acquire)
-                            || _forced_collect_count.load(std::memory_order_relaxed)
-                            || process_state().collector_terminating.load(std::memory_order_relaxed);
                     });
                 }
-                last_mem_allocated = MemoryCounters::alloc_counter();
-                MemoryCounters::reset_all();
-                if (!last_objects_removed && process_state().collector_terminating) {
-                    if (_live_object_count) {
-                        --finalization_counter;
-                    } else {
-                        finalization_counter = 0;
-                    }
-                }
-            } while(finalization_counter);
+            });
+        }
+
+        void _join_destroyer_threads() noexcept {
             for (auto& thread: destroyer_threads()) {
                 thread.join();
             }
-#if SGCL_LOG_PRINT_LEVEL > 0
-            std::cout << "[sgcl] stop collector id: " << std::this_thread::get_id() << std::endl;
-#endif
-            if (process_state().collector_terminating) {
-                _terminated = true;
-                _terminated.notify_all();
-            }
+            destroyer_threads().clear();
         }
 
-        void _force_collect() noexcept {
-            _forced_collect_count.store(2, std::memory_order_release);
-            waking_up();
+        void _cycle(uint64_t target, bool share_live_objects) noexcept {
+            _share_live_objects = share_live_objects;
+            // SPEC.md §4.6. The epoch opens first: a barrier that the demotion erases synchronizes with it (both are
+            // RMWs on the slot state), so the threads, pages and objects registered next include everything that
+            // barrier's thread published, and the stack scan sees its stores. Objects created after registration
+            // stay unregistered: never swept this cycle and never traced, the barrier shades what they reference.
+            _update_states();
+            _register_threads();
+            _register_pages();
+            _register_objects();
+            _mark_stack_roots();
+            _live_object_count = 0;
+            _mark_reachable();
+            _mark_updated<true>();
+            while (_reachable_pages) {
+                _mark_reachable();
+                _mark_updated<false>();
+            }
+            _last_live_object_count.store(_live_object_count, std::memory_order_relaxed);
+            _last_removed = _remove_garbage();
+            _share_live_objects = false;
+            _release_unused_pages();
+
+            std::unique_lock<std::mutex> lock(_mutex);
+            // A request is complete after two cycles started after it: the first may keep objects allocated just
+            // before it began (they are registered already shaded), the second reclaims them (SPEC.md §4.10).
+            if (_previous_target > _completed) {
+                _completed = _previous_target;
+            }
+            _previous_target = target;
+            if (_snapshot_target && _completed >= _snapshot_target) {
+                _snapshot_target = 0;
+                _paused = true;
+            }
+            _cv_done.notify_all();
+            _cv_resume.wait(lock, [this] { return !_paused; });
+        }
+
+        void _main_loop() noexcept {
+            _thread_id.store(std::this_thread::get_id(), std::memory_order_relaxed);
+            // After terminate() (SPEC.md §4.10): until a cycle reclaims nothing, at most MaxTerminationCycles, and
+            // none starting later than TerminationBudget after the request, so threads that keep allocating cannot
+            // hold terminate() for long.
+            constexpr int MaxTerminationCycles = 5;
+            constexpr auto TerminationBudget = std::chrono::seconds(1);
+            int termination_cycles = 0;
+            std::chrono::steady_clock::time_point termination_start;
+            bool stop = false;
+            do {
+                // Before the cycle, so a wake-up that arrives during it is not overwritten.
+                sleep_flag.store(true, std::memory_order_relaxed);
+                uint64_t target;
+                bool share_live_objects;
+                {
+                    std::lock_guard<std::mutex> lock(_mutex);
+                    target = _requested;
+                    // The cycle that will complete the snapshot's request lists the live objects.
+                    share_live_objects = _snapshot_target && _previous_target >= _snapshot_target;
+                }
+                or_fatal([&] {
+                    _live_objects.clear();
+                    _cycle(target, share_live_objects);
+                });
+                bool terminating = process_state().collector_terminating.load(std::memory_order_acquire);
+                if (!terminating) {
+                    std::unique_lock<std::mutex> lock(_mutex);
+                    auto sleep_time = _short_sleep ? config::ShortSleepTime : config::LongSleepTime;
+                    _short_sleep = false;
+                    sleep_cv.wait_for(lock, sleep_time, [this] {
+                        return !sleep_flag.load(std::memory_order_acquire)
+                            || _requested > _completed
+                            || process_state().collector_terminating.load(std::memory_order_relaxed);
+                    });
+                }
+                MemoryCounters::reset_all();
+                if (terminating) {
+                    auto now = std::chrono::steady_clock::now();
+                    if (termination_cycles++ == 0) {
+                        termination_start = now;
+                    }
+                    stop = !_last_removed || termination_cycles >= MaxTerminationCycles
+                        || now - termination_start >= TerminationBudget;
+                }
+            } while(!stop);
+            _join_destroyer_threads();
+            std::lock_guard<std::mutex> lock(_mutex);
+            _stopped = true;
+            _cv_done.notify_all();
+            _cv_stopped.notify_all();
         }
 
         void _terminate() noexcept {
-            if (!process_state().collector_terminating) {
-#if SGCL_LOG_PRINT_LEVEL > 0
-                std::cout << "[sgcl] terminate collector from id: " << std::this_thread::get_id() << std::endl;
-#endif
-                {
-                    std::unique_lock<std::mutex> lock(_mutex);
-                    process_state().collector_terminating.store(true);
-                    waking_up();
-                }
-                _terminated.wait(false);
+            if (_on_collector_thread()) {
+                fatal("collector::terminate() on the collector thread");
             }
+            if (_pause_owner_is_current()) {
+                fatal("collector::terminate() while this thread holds a pause_guard");
+            }
+            std::unique_lock<std::mutex> lock(_mutex);
+            process_state().collector_terminating.store(true, std::memory_order_release);
+            waking_up();
+            _cv_stopped.wait(lock, [this] { return _stopped; });
         }
 
+        // Collector-thread state.
         Thread::Data* _registered_threads = {nullptr};
         Thread::Data* _last_thread_registered = {nullptr};
         Page* _reachable_pages = {nullptr};
         Page* _unreachable_pages = {nullptr};
         Page* _registered_pages = {nullptr};
-        std::atomic<int> _forced_collect_count = {0};
-        std::mutex _mutex;
-        std::vector<void*> _live_objects;
-        size_t _live_object_count;
-        std::atomic<size_t> _last_live_object_count = {0};
-        std::atomic<bool> _live_objects_request = {false};
-        std::atomic<bool> _terminated = {false};
+        size_t _live_object_count = {0};
+        size_t _last_removed = {0};
         bool _share_live_objects = {false};
-        std::condition_variable sleep_cv;
-        std::atomic<bool> sleep_flag = {true};
-        std::vector<uintptr_t> _hazard_pointers;
-        std::condition_variable _cv_data_ready;
-        std::condition_variable _cv_data_processed;
-        bool _dataReady = false;
-        bool _dataProcessed = false;
-        bool _short_sleep = false;
         std::vector<std::thread> _destroyer_threads;
+        bool _short_sleep = {false};
 
-        friend inline void delete_unique(const void*) noexcept;
+        // Shared; the plain fields are guarded by _mutex.
+        std::atomic<std::thread::id> _thread_id = {};
+        std::atomic<std::thread::id> _pause_owner = {};
+        std::atomic<size_t> _last_live_object_count = {0};
+        std::atomic<bool> sleep_flag = {true};
+        std::mutex _mutex;
+        std::condition_variable sleep_cv;
+        std::condition_variable _cv_done;
+        std::condition_variable _cv_resume;
+        std::condition_variable _cv_stopped;
+        uint64_t _requested = {0};
+        uint64_t _completed = {0};
+        uint64_t _previous_target = {0};
+        bool _paused = {false};
+        bool _snapshot_busy = {false};
+        uint64_t _snapshot_target = {0};
+        bool _stopped = {false};
+        std::vector<void*> _live_objects;
     };
 
-#if defined(SGCL_EXTERNAL_STATE)
-    inline Collector& collector_instance() {
+    inline Collector& collector_instance() noexcept {
         return SGCL_STATE_SYMBOL(collector_instance)();
     }
-#else
-    inline Collector& collector_instance() {
-        static Collector collector_instance;
-        return collector_instance;
-    }
-#endif
 
-    inline void collector_init() {
+    inline void collector_init() noexcept {
         collector_instance();
     }
 
-    inline void terminate_collector() noexcept {
-        Collector::terminate();
+    inline void delete_unique(const void* p) noexcept {
+        Collector::delete_unique(p);
     }
 
     inline void waking_up_collector() noexcept {

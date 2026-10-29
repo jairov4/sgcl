@@ -6,7 +6,7 @@
 #define MI_BUILDING_core
 #include "core.h"
 
-#include "sgcl/detail/state_impl.h"
+#include "sgcl/state_impl.h"
 
 namespace mi {
     std::atomic<int>& created() noexcept {
