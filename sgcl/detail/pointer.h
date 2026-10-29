@@ -52,4 +52,10 @@ namespace sgcl::detail {
     };
 
     static_assert(sizeof(Pointer) == sizeof(RawPointer));
+
+    // The process-wide null cell (ProcessState::null_cell), cached per image.
+    inline Pointer* null_cell() noexcept {
+        static Pointer* const cell = reinterpret_cast<Pointer*>(&process_state().null_cell);
+        return cell;
+    }
 }

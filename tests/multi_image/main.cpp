@@ -20,6 +20,8 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <filesystem>
+#include <string>
 #endif
 
 using mi::Node;
@@ -63,7 +65,9 @@ namespace {
 #if defined(__APPLE__)
             void* library = dlopen("@rpath/libd.dylib", RTLD_NOW | RTLD_GLOBAL);
 #else
-            void* library = dlopen("libd.so", RTLD_NOW | RTLD_GLOBAL);
+            // By path: a sanitizer's dlopen interceptor would resolve a bare name with its own RUNPATH.
+            std::string path = std::filesystem::read_symlink("/proc/self/exe").parent_path() / "libd.so";
+            void* library = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
 #endif
             auto churn = library ? reinterpret_cast<int (*)(int)>(dlsym(library, "mi_d_churn")) : nullptr;
 #endif

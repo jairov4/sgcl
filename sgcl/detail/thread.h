@@ -62,8 +62,8 @@ namespace sgcl::detail {
             const Construction _previous;
         };
 
-        explicit Thread(uintptr_t stack_base) noexcept
-        : stack_allocator(checked_new<StackPointerAllocator>(stack_base))
+        Thread(uintptr_t stack_low, uintptr_t stack_base) noexcept
+        : stack_allocator(checked_new<StackPointerAllocator>(stack_low, stack_base))
         , _block_allocator(checked_new<BlockAllocator>())
         , _data(checked_new<Data>(_block_allocator, stack_allocator)) {
             auto& threads_data = process_state().threads_data;

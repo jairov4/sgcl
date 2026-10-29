@@ -5,6 +5,11 @@
 //------------------------------------------------------------------------------
 #include "types.h"
 
+#include <cstring>
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
+
 // SPEC §3.2, §4.2, §4.10, §5.1: ownership handover, adoption, termination.
 
 using namespace std::chrono_literals;
@@ -96,6 +101,50 @@ TEST(Lifecycle_Tests, SixteenByteAlignedTypes) {
     settle();
     EXPECT_EQ(elements[4999].value, 1);
 }
+
+#if !defined(_WIN32)
+namespace {
+    struct DeepTag;
+    using DeepProbe = Probe<DeepTag>;
+
+    // Holds one tracked_ptr per frame; past MaxStackSize they are external roots, still keeping their referents.
+    long hold_deep(long depth, std::atomic<bool>& collected) {
+        tracked_ptr<DeepProbe> here = make_tracked<DeepProbe>(1);
+        char pad[1024];
+        std::memset(pad, (int)depth, sizeof(pad));
+        if (depth == 0) {
+            collector::force_collect(true);
+            collector::force_collect(true);
+            collected = true;
+            return DeepProbe::alive();
+        }
+        long alive = hold_deep(depth - 1, collected);
+        return alive + (here->value == 1 ? 0 : 1000000) + pad[depth % sizeof(pad)] * 0;
+    }
+
+    void* run_deep(void* arg) {
+        auto* result = static_cast<long*>(arg);
+        std::atomic<bool> collected = false;
+        *result = hold_deep(12000, collected);
+        return nullptr;
+    }
+}
+
+// SPEC §4.3: stack roots beyond the shadow stack's depth are external roots, so nothing they reference is collected.
+TEST(Lifecycle_Tests, TrackedPtrsDeeperThanTheShadowStack) {
+    ASSERT_TRUE(collect_until([] { return DeepProbe::alive() == 0; }));
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 64 * 1024 * 1024);
+    pthread_t thread;
+    long alive_at_bottom = 0;
+    ASSERT_EQ(pthread_create(&thread, &attr, run_deep, &alive_at_bottom), 0);
+    pthread_join(thread, nullptr);
+    pthread_attr_destroy(&attr);
+    EXPECT_EQ(alive_at_bottom, 12001);
+    EXPECT_TRUE(collect_until([] { return DeepProbe::alive() == 0; }));
+}
+#endif
 
 TEST(Lifecycle_Tests, ResizeValueInitializesScalars) {
     vector<long> v{1, 2, 3, 4, 5, 6, 7, 8};

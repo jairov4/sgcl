@@ -259,7 +259,7 @@ Transitions; *M* is the allocating or storing mutator thread, *C* the collector:
 | `Reserved` → `Constructing` | M | `make_tracked`, before the constructor |
 | `Constructing` → `UniqueLock` | M | the constructor returned |
 | `Constructing` → `BadAlloc` | M | the constructor threw |
-| `Used`, `Reachable` → `Reachable` | M | write barrier: a non-null pointer to the slot was stored into any `tracked_ptr`; always an atomic RMW on the state |
+| `Used` → `Reachable` | M | write barrier: a non-null pointer to the slot was stored into any `tracked_ptr` (a slot already `Reachable` is left alone) |
 | `UniqueLock`, `Constructing` → unchanged | M | write barrier on an object still owned or under construction: an alias, not a handover |
 | `UniqueLock` → `Reachable` | M | handover: a `tracked_ptr` is built or assigned from the owning `unique_ptr` (§3.2) |
 | `BadAlloc`, `Destroyed` → unchanged | M | write barrier on a dead slot (a pointer that leaked out of a failed constructor): ignored, see §5.1 |
@@ -276,9 +276,11 @@ No other transition exists. A slot in `ReachableMask` is never destroyed.
 Every `tracked_ptr` holds a *cell*, an atomic word containing the referent's address. Where the cell lives depends on
 where the `tracked_ptr` object itself lives, decided once when it is constructed:
 
-1. **Stack root**: the `tracked_ptr` is within `MaxOffsetForStackDetection` (4 KiB) of the current stack pointer. Its
-   cell is the slot of a per-thread *shadow stack* at the `tracked_ptr`'s distance from the thread's stack base. The
-   collector scans every shadow stack once per cycle.
+1. **Stack root**: the `tracked_ptr` is within `MaxOffsetForStackDetection` (4 KiB) of the current stack pointer and
+   inside the top `MaxStackSize` bytes of the thread's real stack, as the platform reports it. Its cell is the slot of
+   a per-thread *shadow stack* at the `tracked_ptr`'s distance from the thread's stack base. The collector scans every
+   shadow stack once per cycle. A `tracked_ptr` near the stack pointer but elsewhere (a sanitizer's fake stack, a
+   fiber's stack, a frame deeper than `MaxStackSize`) is an external root instead.
 2. **Child**: the `tracked_ptr` is constructed inside the managed allocation currently being constructed on this
    thread (between `Constructing` and the end of the constructor; for vector elements, the element being constructed)
    at an offset recorded in the type's child layout (§4.4). The cell is the `tracked_ptr` itself. It is not a root;
@@ -314,7 +316,8 @@ pointer into managed memory kept at such a word reads as null in that object's d
 ### 4.5 Write barrier
 
 Storing a non-null pointer into any cell (construction, assignment, `swap`) is a release store of the cell followed by
-`set_state<Reachable>` on the referent's slot (§4.2) and a release store of the page's `state_updated` flag. Storing
+the barrier on the referent's slot (§4.2: `Used` becomes `Reachable`) and a release store of the page's `state_updated`
+flag. Storing
 null needs no barrier. Together with the stack scan this is an *insertion* barrier: an object that becomes reachable
 during a cycle is shaded and survives the cycle. Objects that become unreachable during a cycle may survive it
 (floating garbage) and are collected by the next one.
@@ -324,8 +327,11 @@ during a cycle is shaded and survives the cycle. Objects that become unreachable
 The collector thread repeats:
 
 1. **Start the epoch**: clear `reachable` and `marked`; on pages with `state_updated` set, demote `Reachable` to `Used`
-   (a CAS that never overwrites a handover or a destruction). A barrier this erases is an RMW on the same state, so
-   it synchronizes with the demotion: everything its thread did before it is visible to the steps below.
+   (a CAS that never overwrites a handover or a destruction), then issue a *process fence*: a full memory barrier
+   executed by every thread of the process (`FlushProcessWriteBuffers` on Windows, `membarrier` or a page-protection
+   change on Linux, an interruption of every thread on Apple platforms). A barrier that read a `Reachable` the demotion
+   then erased did so before its thread's fence point, so the cell store it guarded is visible to the steps below;
+   every barrier after that point sees the demotion. This keeps the barrier's common case a plain load.
 2. **Register threads and pages**: link newly created thread records and pages (acquire loads of the lock-free lists).
    Drop the records of threads that exited; their pages stay and keep being collected.
 3. **Register objects**: on each page whose `object_created` flag is set, set the `registered` bit of every slot whose
@@ -489,7 +495,6 @@ Each of these is detected in every build mode (not only with assertions enabled)
 | `tracked_ptr(U* p)` where `p` is not in the first `PageSize` bytes of a live page | page registry |
 | `tracked_ptr(U* p)` where `p`'s slot is not live (`Unused`, `Reserved`, `Destroyed`, `BadAlloc`) | slot state check |
 | More than `SGCL_MAX_TYPES_NUMBER` managed types | type counter |
-| A stack root deeper than `MaxStackSize` from its thread's stack base | shadow-stack index |
 | `get_live_objects()` or `terminate()` on the collector thread | thread identity |
 | `get_live_objects()`, `force_collect(true)` or `terminate()` while the calling thread holds a `pause_guard` | thread identity |
 | Any SGCL use that needs the thread's record after it retired at thread exit | retired flag |
@@ -533,7 +538,7 @@ Each handoff between a mutator and the collector is a release store paired with 
 | array `metadata` after the elements are zeroed | `metadata` before tracing the elements |
 | a child cell's initial null (a relaxed atomic store: the storage may already be traced, and null needs no ordering) | child-field loads while tracing |
 | page registry bit set (release) after the page header word | registry lookup (acquire) before reading the header |
-| write barrier (RMW on the slot state, acq_rel) | epoch demotion (CAS, acq_rel) |
+| cell store and write barrier before a thread's process-fence point | everything the collector reads after the fence (§4.6 step 1) |
 | pool slots returned at thread exit (`Unused` store, `unused_atomic` add) | page release accounting |
 
 | Publication (collector, release) | Observation (mutator, acquire) |
@@ -554,9 +559,9 @@ ABA-prone against the collector's re-sorting).
 | Alignment of a managed type or vector element | at most 16 bytes on every platform (the largest `alignof(std::max_align_t)` of the supported targets, so a `std::function` or `long double` member is supported); compile-time error beyond |
 | Address space | managed memory below 2^48 (the page registry); fatal beyond |
 | Number of managed types per process | `SGCL_MAX_TYPES_NUMBER` (default 4096); fatal beyond |
-| Depth of a thread's stack that holds `tracked_ptr`s | `MaxStackSize` (8 MiB) from the stack base; fatal beyond |
+| Depth covered by the shadow stack | `MaxStackSize` (8 MiB) from the stack base; deeper `tracked_ptr`s are external roots |
 | Addresses on x86-64 | user heap and stack addresses have the two highest bits clear (they carry storage-class tags) |
-| Stack switching | fibers, coroutines on separate stacks, `longjmp` across `tracked_ptr`s, sanitizer fake stacks (ASan `detect_stack_use_after_return`): unsupported |
+| Stack switching | a `tracked_ptr` on a fiber's or coroutine's own stack, or on a sanitizer's fake stack (ASan `detect_stack_use_after_return`), is an external root; `longjmp` across `tracked_ptr`s is unsupported |
 | Cycles through external roots | never collected |
 | Allocation rate | one collector thread; mutators allocating faster than it can mark and sweep make cycles longer, not incorrect |
 | Collector restarts | none: once terminated, the collector stays stopped |
@@ -568,5 +573,5 @@ ABA-prone against the collector's re-sorting).
 - **Unknown stack base.** Where the platform does not report a thread's stack base, the shadow stack is indexed by
   address modulo `MaxStackSize`, and two live stack roots `MaxStackSize` apart share a cell. Every supported platform
   reports it.
-- **Shadow-stack size.** `MaxStackSize` is fixed at 8 MiB per thread of virtual address space; deriving it from each
-  thread's real stack size would lift the depth limit.
+- **Shadow-stack size.** `MaxStackSize` is fixed at 8 MiB per thread of virtual address space; deeper frames pay an
+  external-root cell per `tracked_ptr`. Sizing the shadow from each thread's real stack would avoid that cost.

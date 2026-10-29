@@ -32,7 +32,8 @@ namespace sgcl::detail {
         : metadata(&Info<T>::private_metadata())
         , block(block)
         , data((uintptr_t)data)
-        , multiplier((1ull << 32 | 0x10000) / metadata->object_size) {
+        , multiplier((1ull << 32 | 0x10000) / metadata->object_size)
+        , object_count(metadata->object_count) {
             assert(data != nullptr);
             auto states = this->states();
             for (unsigned i = 0; i < metadata->object_count; ++i) {
@@ -116,12 +117,11 @@ namespace sgcl::detail {
             } else if constexpr(S == State::Reachable) {
                 // The write barrier (SPEC.md §4.2, §4.5): only Used is promoted. UniqueLock and Constructing keep
                 // their protection (a store is an alias, not a handover), and a dead or free slot is never revived.
-                // Always an RMW, so it is ordered against the collector's Reachable -> Used demotion and the cell
-                // store before it is visible to the cycle that demotes.
+                // A Reachable read here may predate the collector's demotion: the process fence that follows the
+                // demotion makes this thread's preceding cell store visible to the cycle anyway.
                 auto current = state.load(std::memory_order_relaxed);
-                while ((current == State::Used || current == State::Reachable)
-                       && !state.compare_exchange_weak(current, State::Reachable, std::memory_order_acq_rel,
-                                                       std::memory_order_relaxed)) {
+                while (current == State::Used
+                       && !state.compare_exchange_weak(current, State::Reachable, std::memory_order_relaxed)) {
                 }
                 page->state_updated.store(true, std::memory_order_release);
             } else {
@@ -132,7 +132,7 @@ namespace sgcl::detail {
         // A unique_ptr gives its object to a tracked_ptr: UniqueLock -> Reachable.
         static void hand_over(const void* p) noexcept {
             auto page = Page::page_of(p);
-            page->states()[page->index_of(p)].exchange(State::Reachable, std::memory_order_acq_rel);
+            page->states()[page->index_of(p)].store(State::Reachable, std::memory_order_relaxed);
             page->state_updated.store(true, std::memory_order_release);
         }
 
@@ -140,6 +140,7 @@ namespace sgcl::detail {
         Block* const block;
         const uintptr_t data;
         const uint64_t multiplier;
+        const unsigned object_count;
         size_t alloc_size = 0;
         bool reachable = {false};
         bool unreachable = {false};

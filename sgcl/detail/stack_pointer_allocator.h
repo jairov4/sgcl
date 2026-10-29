@@ -12,7 +12,8 @@
 
 namespace sgcl::detail {
     // A thread's shadow stack (SPEC.md §4.3): one cell per pointer-sized stack word, indexed by the word's
-    // distance below the thread's stack base. Pages are zeroed on first use.
+    // distance below the thread's stack base, covering the top MaxStackSize bytes of the thread's real stack.
+    // Pages are zeroed on first use.
     struct StackPointerAllocator {
 #ifdef SGCL_ARCH_X86_64
         static constexpr size_t Scale = 1;
@@ -25,19 +26,23 @@ namespace sgcl::detail {
         static constexpr size_t ShadowSize = config::MaxStackSize / Scale;
         static constexpr unsigned PageCount = ShadowSize / PageSize;
 
-        // `stack_base` is the highest address of the thread's stack, or 0 when the platform did not report it.
-        explicit StackPointerAllocator(uintptr_t stack_base) noexcept
-        : base(stack_base) {
+        // [stack_low, stack_base) is the thread's real stack, or both are 0 when the platform did not report it.
+        StackPointerAllocator(uintptr_t stack_low, uintptr_t stack_base) noexcept
+        : low(stack_low)
+        , base(stack_base) {
         }
 
+        // The cell for a tracked_ptr at `p`, or null when `p` is outside the covered part of the real stack: a
+        // sanitizer's fake stack, a fiber's stack or a frame deeper than MaxStackSize. Such a tracked_ptr becomes
+        // an external root.
         Pointer* alloc(void* p) noexcept {
             size_t offset;
             if (base) {
-                auto distance = base - (uintptr_t)p;
-                if (distance >= config::MaxStackSize) {
-                    fatal("a tracked_ptr lies deeper than MaxStackSize below its thread's stack base");
+                auto address = (uintptr_t)p;
+                if (address < low || address >= base || base - address >= config::MaxStackSize) {
+                    return nullptr;
                 }
-                offset = (distance / Scale) & ~(sizeof(RawPointer) - 1);
+                offset = ((base - address) / Scale) & ~(sizeof(RawPointer) - 1);
             } else {
                 offset = ((uintptr_t)p / Scale) % ShadowSize & ~(sizeof(RawPointer) - 1);
             }
@@ -49,6 +54,7 @@ namespace sgcl::detail {
             return (Pointer*)((char*)data + offset);
         }
 
+        const uintptr_t low;
         const uintptr_t base;
         std::atomic<bool> is_used[PageCount] = {};
         union {

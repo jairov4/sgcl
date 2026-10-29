@@ -26,6 +26,12 @@
 #define SGCL_FINALIZE_HOOK sgcl_finalize
 #endif
 
+#if defined(_MSC_VER)
+#define SGCL_NOINLINE __declspec(noinline)
+#else
+#define SGCL_NOINLINE __attribute__((noinline))
+#endif
+
 #define SGCL_DETAIL_CAT2(a, b) a##b
 #define SGCL_DETAIL_CAT(a, b) SGCL_DETAIL_CAT2(a, b)
 #define SGCL_STATE_SYMBOL(name) SGCL_DETAIL_CAT(name##_max_types_, SGCL_MAX_TYPES_NUMBER)

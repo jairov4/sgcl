@@ -11,6 +11,7 @@
 #include <atomic>
 #include <bit>
 #include <cstring>
+#include <vector>
 
 namespace sgcl::detail {
     // The child layout of one managed type (SPEC.md §4.4): one bit per pointer-sized word of the object, set when
@@ -50,7 +51,10 @@ namespace sgcl::detail {
                 size_t value;
                 std::memcpy(&value, cell, sizeof(value));
                 if (value == 1) {
-                    byte.fetch_or(bit, std::memory_order_relaxed);
+                    if (!(byte.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+                        // release: a collector that sees the new version sees the bit.
+                        version.fetch_add(1, std::memory_order_release);
+                    }
                     return true;
                 }
             }
@@ -69,8 +73,24 @@ namespace sgcl::detail {
             }
         }
 
+        // Collector only: the recorded words as a compact list, rebuilt when the layout gained a bit.
+        const std::vector<uint32_t>& words() const {
+            auto current = version.load(std::memory_order_acquire);
+            if (current != _words_version) {
+                _words.clear();
+                for_each([&](size_t word) { _words.push_back((uint32_t)word); });
+                _words_version = current;
+            }
+            return _words;
+        }
+
         std::atomic<bool> final;
         const size_t size;
         std::atomic<uint8_t>* const map;
+        std::atomic<unsigned> version = {0};
+
+    private:
+        mutable std::vector<uint32_t> _words;
+        mutable unsigned _words_version = ~0u;
     };
 }

@@ -14,7 +14,7 @@ TEST(TrackedPtr_Tests, DefaultConstructor) {
     { // stack
         tracked_ptr<int> ptr;
         EXPECT_EQ(ptr, nullptr);
-        EXPECT_TRUE(TrackedPtrAccess::on_stack(ptr));
+        EXPECT_TRUE(TrackedPtrAccess::on_stack(ptr) || on_fake_stack());
     }
     { // child
         auto ptr = make_tracked<tracked_ptr<int>>();
@@ -337,7 +337,7 @@ TEST(TrackedPtr_Tests, Swap) {
         n->swap(*e);
         EXPECT_EQ(*e, nullptr);
         EXPECT_EQ(**n, 2);
-        EXPECT_TRUE(TrackedPtrAccess::on_stack(s));
+        EXPECT_TRUE(TrackedPtrAccess::on_stack(s) || on_fake_stack());
         EXPECT_TRUE(TrackedPtrAccess::child(*c));
         EXPECT_TRUE(TrackedPtrAccess::external(*e));
     }
@@ -527,7 +527,7 @@ TEST(TrackedPtr_Tests, MovedFromIsNullAndUsable) {
     { // stack
         tracked_ptr<MovedFrom> p = make_tracked<MovedFrom>(2);
         tracked_ptr<MovedFrom> q(std::move(p));
-        EXPECT_TRUE(TrackedPtrAccess::on_stack(p));
+        EXPECT_TRUE(TrackedPtrAccess::on_stack(p) || on_fake_stack());
         check_moved_from(p, other);
         tracked_ptr<MovedFrom> r = make_tracked<MovedFrom>(3);
         q = std::move(r);

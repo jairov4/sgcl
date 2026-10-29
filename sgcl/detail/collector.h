@@ -125,7 +125,7 @@ namespace sgcl::detail {
         static void delete_unique(const void* p) noexcept {
             auto page = Page::page_of(p);
             auto ptr = Page::base_address_of(p);
-            _destroy(page, ptr, false);
+            _destroy(page, ptr);
             Page::set_state<State::Destroyed>(p);
         }
 
@@ -133,8 +133,8 @@ namespace sgcl::detail {
         // A word read at a child offset is traced only when it points into a live page (SPEC.md §4.4): zero is
         // null, 1 is the discovery sentinel, a tagged value is the ref of a non-child tracked_ptr, and anything
         // else may be foreign data sharing the offset in type-erased storage.
-        static bool _is_referent(const void* p) noexcept {
-            return (uintptr_t)p > 1 && process_state().pages.contains(p);
+        bool _is_referent(const void* p) noexcept {
+            return (uintptr_t)p > 1 && _pages.contains(p, _cursor);
         }
 
         bool _on_collector_thread() const noexcept {
@@ -295,8 +295,8 @@ namespace sgcl::detail {
                         auto index = offset + std::countr_zero(registered);
                         auto& state = states[index];
                         auto expected = State::Reachable;
-                        // Never overwrites a handover or a destruction; acq_rel pairs with the barrier's RMW.
-                        state.compare_exchange_strong(expected, State::Used, std::memory_order_acq_rel, std::memory_order_relaxed);
+                        // Never overwrites a handover or a destruction.
+                        state.compare_exchange_strong(expected, State::Used, std::memory_order_relaxed);
                         registered &= registered - 1;
                     }
                 }
@@ -307,7 +307,7 @@ namespace sgcl::detail {
             auto page = Page::page_of(ptr);
             auto index = page->index_of(ptr);
             // A foreign value inside a live page may fall past its last slot or on its header word.
-            if (index >= page->metadata->object_count) {
+            if (index >= page->object_count) {
                 return;
             }
             auto mask = Page::flag_mask_of(index);
@@ -343,13 +343,13 @@ namespace sgcl::detail {
             }
         }
 
-        void _mark_childs(void* ptr, const ChildPointers& layout) noexcept {
-            layout.for_each([&](size_t word) {
+        void _mark_childs(void* ptr, const std::vector<uint32_t>& words) noexcept {
+            for (auto word : words) {
                 auto p = ((RawPointer*)ptr + word)->load(std::memory_order_acquire);
                 if (_is_referent(p)) {
                     _mark(p);
                 }
-            });
+            }
         }
 
         void _mark_array_childs(void* ptr) noexcept {
@@ -359,9 +359,10 @@ namespace sgcl::detail {
                 return;
             }
             // Every element up to capacity: [size, capacity) is zero (SPEC.md §4.8).
+            auto& words = metadata->child_pointers.words();
             auto data = (uintptr_t)array + ArrayDataOffset;
             for (size_t i = 0; i < array->capacity; ++i, data += metadata->object_size) {
-                _mark_childs((void*)data, metadata->child_pointers);
+                _mark_childs((void*)data, words);
             }
         }
 
@@ -388,7 +389,7 @@ namespace sgcl::detail {
                                 if (is_array) {
                                     _mark_array_childs(ptr);
                                 } else {
-                                    _mark_childs(ptr, metadata->child_pointers);
+                                    _mark_childs(ptr, metadata->child_pointers.words());
                                 }
                                 ++_live_object_count;
                                 if (_share_live_objects) {
@@ -461,43 +462,50 @@ namespace sgcl::detail {
         }
 
         // Only words holding a referent: a foreign value sharing the offset stays as its owner left it.
-        static void _clear_childs(void* ptr, const ChildPointers& layout) noexcept {
-            layout.for_each([&](size_t word) {
+        void _clear_childs(void* ptr, const std::vector<uint32_t>& words) noexcept {
+            for (auto word : words) {
                 auto cell = (RawPointer*)ptr + word;
                 if (_is_referent(cell->load(std::memory_order_relaxed))) {
                     cell->store(nullptr, std::memory_order_relaxed);
                 }
-            });
+            }
         }
 
-        static void _clear_array_childs(ArrayBase* array, ArrayMetadata* metadata) noexcept {
+        void _clear_array_childs(ArrayBase* array, ArrayMetadata* metadata) noexcept {
             if (!metadata->child_pointers.size) {
                 return;
             }
+            auto& words = metadata->child_pointers.words();
             auto data = (uintptr_t)array + ArrayDataOffset;
             for (size_t i = 0; i < array->size; ++i, data += metadata->object_size) {
-                _clear_childs((void*)data, metadata->child_pointers);
+                _clear_childs((void*)data, words);
             }
         }
 
-        // With clear_childs, the children are nulled first so the destructor touches no other dead object.
-        static void _destroy(Page* page, void* ptr, bool clear_childs) noexcept {
+        // The sweep's destruction: children are nulled first, so the destructor touches no other dead object.
+        void _destroy_garbage(Page* page, void* ptr) noexcept {
+            if (!page->metadata->destroy) {
+                return;
+            }
+            if (!page->metadata->is_array) {
+                _clear_childs(ptr, page->metadata->child_pointers.words());
+            } else if (auto metadata = ((ArrayBase*)ptr)->metadata.load(std::memory_order_acquire);
+                       metadata && !metadata->tracked_ptrs_only) {
+                _clear_array_childs((ArrayBase*)ptr, metadata);
+            }
+            _destroy(page, ptr);
+        }
+
+        static void _destroy(Page* page, void* ptr) noexcept {
             auto destroy = page->metadata->destroy;
             if (!destroy) {
                 return;
             }
             if (!page->metadata->is_array) {
-                if (clear_childs) {
-                    _clear_childs(ptr, page->metadata->child_pointers);
-                }
                 destroy(ptr);
             } else {
-                auto array = (ArrayBase*)ptr;
-                auto metadata = array->metadata.load(std::memory_order_acquire);
+                auto metadata = ((ArrayBase*)ptr)->metadata.load(std::memory_order_acquire);
                 if (metadata && !metadata->tracked_ptrs_only) {
-                    if (clear_childs) {
-                        _clear_array_childs(array, metadata);
-                    }
                     destroy(ptr);
                 }
             }
@@ -567,7 +575,7 @@ namespace sgcl::detail {
                             continue;
                         }
                         if (state == State::Unreachable) {
-                            _destroy(page, page->pointer_of(index), true);
+                            _destroy_garbage(page, page->pointer_of(index));
                         }
                         ++removed;
                         flag.finalized &= ~mask;
@@ -668,6 +676,9 @@ namespace sgcl::detail {
             // barrier's thread published, and the stack scan sees its stores. Objects created after registration
             // stay unregistered: never swept this cycle and never traced, the barrier shades what they reference.
             _update_states();
+            // Every mutator's stores before this point are visible below, and its barrier loads after it see the
+            // demotion, so a barrier that read a stale Reachable cannot hide the store it guarded.
+            SGCL_STATE_SYMBOL(process_fence)();
             _register_threads();
             _register_pages();
             _register_objects();
@@ -776,6 +787,8 @@ namespace sgcl::detail {
         bool _share_live_objects = {false};
         std::vector<std::thread> _destroyer_threads;
         bool _short_sleep = {false};
+        PageRegistry& _pages = process_state().pages;
+        PageRegistry::Cursor _cursor;
 
         // Shared; the plain fields are guarded by _mutex.
         std::atomic<std::thread::id> _thread_id = {};

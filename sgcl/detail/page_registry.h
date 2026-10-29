@@ -52,6 +52,29 @@ namespace sgcl::detail {
             return leaf[index / 64].load(std::memory_order_acquire) & (uint64_t(1) << (index % 64));
         }
 
+        // A cursor for the collector's lookups: leaves never move, so a found one is kept; a missing one is not.
+        struct Cursor {
+            uintptr_t root = ~uintptr_t(0);
+            std::atomic<uint64_t>* leaf = nullptr;
+        };
+
+        bool contains(const void* p, Cursor& cursor) const noexcept {
+            auto page = (uintptr_t)p >> PageBits;
+            if (page >> (AddressBits - PageBits)) {
+                return false;
+            }
+            auto root = page >> LeafBits;
+            if (root != cursor.root) {
+                auto leaf = _root[root].load(std::memory_order_acquire);
+                if (!leaf) {
+                    return false;
+                }
+                cursor = {root, leaf};
+            }
+            auto index = page & ((size_t(1) << LeafBits) - 1);
+            return cursor.leaf[index / 64].load(std::memory_order_acquire) & (uint64_t(1) << (index % 64));
+        }
+
     private:
         struct Location {
             std::atomic<uint64_t>* leaf;

@@ -21,6 +21,27 @@
 
 using namespace sgcl;
 
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define SGCL_TEST_ASAN 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+#define SGCL_TEST_ASAN 1
+#endif
+#if defined(SGCL_TEST_ASAN)
+#include <sanitizer/asan_interface.h>
+#endif
+
+// Under ASan's detect_stack_use_after_return locals live on a fake stack, where tracked_ptrs are external roots.
+inline bool on_fake_stack() {
+#if defined(SGCL_TEST_ASAN)
+    return __asan_get_current_fake_stack() != nullptr;
+#else
+    return false;
+#endif
+}
+
 struct Bar {
     virtual ~Bar() = default;
     virtual int get_value() const { return 0; };

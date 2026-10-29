@@ -164,9 +164,10 @@ namespace sgcl {
         }
 
         // The ref word names the cell and its storage class. On x86-64 a child keeps its cell in the word itself
-        // and the others tag the cell's address with the two highest bits; elsewhere a child's word is 0 and the
-        // others hold the complement of the tagged address. Either way a ref word is never an address inside the
-        // 48-bit range the page registry covers, so the collector never mistakes one for a referent (SPEC.md §4.4).
+        // and the others tag the cell's address with the two highest bits; elsewhere every ref word is the
+        // complement of the cell's address tagged in its low bits (0 for a child). Either way a ref word is never
+        // an address inside the 48-bit range the page registry covers, so the collector never mistakes one for a
+        // referent (SPEC.md §4.4).
         static uintptr_t _encode(detail::Pointer* cell, uintptr_t flag) noexcept {
 #ifdef SGCL_ARCH_X86_64
             if ((uintptr_t)cell & ~ClearMask) {
@@ -182,7 +183,7 @@ namespace sgcl {
 #ifdef SGCL_ARCH_X86_64
             return _ref & ~ClearMask;
 #else
-            return _ref ? ~_ref & ~ClearMask : 0;
+            return ~_ref & ~ClearMask;
 #endif
         }
 
@@ -214,7 +215,7 @@ namespace sgcl {
         }
 
         static detail::Pointer* _null_cell() noexcept {
-            return reinterpret_cast<detail::Pointer*>(&detail::process_state().null_cell);
+            return detail::null_cell();
         }
 
         bool _has_null_cell() const noexcept {
@@ -222,9 +223,11 @@ namespace sgcl {
         }
 
         detail::Pointer* _cell() const noexcept {
+#ifdef SGCL_ARCH_X86_64
             if (_is_child()) [[likely]] {
                 return const_cast<detail::Pointer*>(&_raw_ptr);
             }
+#endif
             return _decoded();
         }
 
@@ -242,13 +245,19 @@ namespace sgcl {
 
         // A writable cell: a moved-from external root gets a fresh one.
         detail::Pointer* _writable_cell() noexcept {
-            if (_has_null_cell()) {
-                _ref = _encode(_new_external_cell(), ExternalHeapFlag);
+            if (_is_external()) [[unlikely]] {
+                _replace_null_cell();
             }
             return _cell();
         }
 
-        static detail::Pointer* _new_external_cell() noexcept {
+        SGCL_NOINLINE void _replace_null_cell() noexcept {
+            if (_decoded() == _null_cell()) {
+                _ref = _encode(_new_external_cell(), ExternalHeapFlag);
+            }
+        }
+
+        SGCL_NOINLINE static detail::Pointer* _new_external_cell() noexcept {
             return detail::Maker<detail::Pointer>::make_tracked().release();
         }
 
@@ -268,15 +277,19 @@ namespace sgcl {
         bool _init_stack_or_child() noexcept {
             auto& thread = detail::current_thread();
             if (_this_on_stack()) {
-                _ref = _encode(thread.stack_allocator->alloc(this), StackFlag);
-                _cell()->store(nullptr);
+                auto cell = thread.stack_allocator->alloc(this);
+                if (!cell) {
+                    return false;
+                }
+                // A free shadow cell is null: every stack tracked_ptr nulls its cell when destroyed.
+                _ref = _encode(cell, StackFlag);
                 return true;
             }
             auto& c = thread.construction;
             auto cell = (uintptr_t)&_raw_ptr;
             if (cell - c.base < c.size && c.layout->claim(&_raw_ptr, cell - c.base)) {
 #ifndef SGCL_ARCH_X86_64
-                _ref = 0;
+                _ref = _encode(&_raw_ptr, 0);
 #endif
                 // An atomic store, not a constructor: the collector may already trace this storage, and reads it
                 // as a RawPointer like every cell.

@@ -79,6 +79,8 @@ namespace sgcl::detail {
     Thread& current_thread() noexcept;
     SGCL_API Collector& SGCL_STATE_SYMBOL(collector_instance)() noexcept;
     SGCL_API Thread& SGCL_STATE_SYMBOL(current_thread)() noexcept;
+    // A full memory barrier executed by every thread of the process (SPEC.md §4.6 step 1).
+    SGCL_API void SGCL_STATE_SYMBOL(process_fence)() noexcept;
     void waking_up_collector() noexcept;
     void force_short_sleep() noexcept;
     std::vector<std::thread>& destroyer_threads() noexcept;
