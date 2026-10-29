@@ -115,7 +115,7 @@ namespace sgcl::detail {
         static void _free(Page* pages) noexcept {
             DataPage* empty = nullptr;
             for (Page* page = pages; page; page = page->next_empty) {
-                DataPage* data = (DataPage*)(page->data - sizeof(void*));
+                DataPage* data = (DataPage*)(page->data & ~(uintptr_t)(config::PageSize - 1));
                 process_state().pages.remove(data);
                 data->block = page->block;
                 page->is_used = false;

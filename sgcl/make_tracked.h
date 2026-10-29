@@ -13,8 +13,7 @@ namespace sgcl {
     template<class T, class... A>
         requires (std::is_object_v<T> && !std::is_array_v<T>)
     unique_ptr<T> make_tracked(A&&... a) {
-        static_assert(sizeof(detail::Array<sizeof(T)>) <= detail::PageDataSize, "object is too large (SPEC.md §8)");
-        static_assert(alignof(T) <= alignof(void*), "managed types are at most pointer-aligned (SPEC.md §8)");
+        static_assert(sizeof(T) <= detail::PageInfo<T>::PageCapacity, "object is too large (SPEC.md §8)");
         return unique_ptr<T>(detail::Maker<T>::make_tracked(std::forward<A>(a)...));
     }
 }

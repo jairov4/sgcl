@@ -16,6 +16,10 @@
 namespace sgcl::detail {
     using RawPointer = std::atomic<void*>;
 
+    // The strictest alignment a managed type or vector element may have, on every platform (SPEC.md §8): the
+    // largest alignof(std::max_align_t) of the supported targets.
+    inline constexpr size_t MaxAlign = 16;
+
     template<size_t>
     struct Array;
     struct ArrayBase;

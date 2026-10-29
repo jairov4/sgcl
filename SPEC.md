@@ -218,8 +218,9 @@ destroy, finalize and free functions live in that image, §4.9), **MUST** stay l
 - **Block**: one `malloc` holding 15 *data pages* of `PageSize` (64 KiB), aligned to `PageSize`. A thread carves pages
   out of its current block; free pages go to a process-wide lock-free stack and are reused by any thread; a block whose
   15 pages are all free is returned to `free`.
-- **Data page**: word 0 points to the page's **page header**; the remaining `PageSize - 8` bytes are *slots* of one
-  managed type, `ObjectCount = max(1, (PageSize - 8) / sizeof(T))` of them. `Page::page_of(p)` masks any address inside
+- **Data page**: word 0 points to the page's **page header**; *slots* of one managed type start at
+  `DataOffset = max(8, alignof(T))`, `ObjectCount = max(1, (PageSize - DataOffset) / sizeof(T))` of them, so every slot
+  is aligned for `T`. `Page::page_of(p)` masks any address inside
   a data page down to the page and reads word 0, so every interior pointer of a slot (a base subobject, a member) maps
   to its page and, through a fixed-point reciprocal of `sizeof(T)`, to its slot index.
 - **Page header** (separate allocation): the type's `Metadata`, one atomic `State` per slot, three collector-private
@@ -371,7 +372,8 @@ A managed class type that declares, or inherits, a member function `void SGCL_FI
 
 ### 4.8 Containers
 
-**`vector<T>`** holds a `tracked_ptr` to an array allocation `{metadata, size, capacity, elements}`. Elements are
+**`vector<T>`** holds a `tracked_ptr` to an array allocation `{metadata, size, capacity, elements}`; the elements
+start 16-byte aligned after the header. Elements are
 constructed in place (child discovery applies per element); slots in `[size, capacity)` are zero. Growth allocates a
 new array, moves (or copies, §6) the elements and drops the old array, which the collector reclaims later with its
 moved-from elements. Element destructors of discarded storage run on the collector thread; `clear`, `pop_back`,
@@ -549,7 +551,7 @@ ABA-prone against the collector's re-sorting).
 | Limit | Value |
 |---|---|
 | Size of one object passed to `make_tracked` | about 64 KiB (`PageSize - 8` minus the array header); compile-time error beyond |
-| Alignment of a managed type or vector element | at most `alignof(void*)`; compile-time error beyond |
+| Alignment of a managed type or vector element | at most 16 bytes on every platform (the largest `alignof(std::max_align_t)` of the supported targets, so a `std::function` or `long double` member is supported); compile-time error beyond |
 | Address space | managed memory below 2^48 (the page registry); fatal beyond |
 | Number of managed types per process | `SGCL_MAX_TYPES_NUMBER` (default 4096); fatal beyond |
 | Depth of a thread's stack that holds `tracked_ptr`s | `MaxStackSize` (8 MiB) from the stack base; fatal beyond |

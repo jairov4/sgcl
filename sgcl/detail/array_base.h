@@ -10,6 +10,8 @@
 #include <memory>
 
 namespace sgcl::detail {
+    struct ArrayBase;
+
     // Header of a vector's storage: elements [0, size) are constructed, [size, capacity) are zero (SPEC.md §4.8).
     struct ArrayBase {
         constexpr ArrayBase(size_t s, size_t c) noexcept
@@ -39,4 +41,7 @@ namespace sgcl::detail {
             }
         }
     };
+
+    // Where elements start after the header, for any element alignment up to MaxAlign.
+    inline constexpr size_t ArrayDataOffset = (sizeof(ArrayBase) + MaxAlign - 1) / MaxAlign * MaxAlign;
 }

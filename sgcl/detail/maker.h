@@ -116,7 +116,7 @@ namespace sgcl::detail {
 
     public:
         static constexpr size_t max_capacity() noexcept {
-            return (SIZE_MAX - sizeof(Array<>) - sizeof(uintptr_t) - config::PageSize) / sizeof(Type);
+            return (SIZE_MAX - ArrayDataOffset - 2 * config::PageSize) / sizeof(Type);
         }
 
         // Returns the address of element 0; the slot is UniqueLock. `capacity` may be rounded up to the size
@@ -136,11 +136,11 @@ namespace sgcl::detail {
         }
 
         static void* data_of(ArrayBase* array) noexcept {
-            return array + 1;
+            return (char*)array + ArrayDataOffset;
         }
 
         static ArrayBase* header_of(const void* data) noexcept {
-            return (ArrayBase*)data - 1;
+            return (ArrayBase*)((const char*)data - ArrayDataOffset);
         }
 
     private:
@@ -162,22 +162,22 @@ namespace sgcl::detail {
         // Size classes grow from one word by 3/2 up to a page; beyond that the storage is a large allocation.
         template<size_t N = sizeof(uintptr_t)>
         static ArrayBase* _make_array(size_t bytes) noexcept {
-            if constexpr(sizeof(Array<N>) <= PageDataSize) {
+            if constexpr(sizeof(Array<N>) <= PageInfo<Array<N>>::PageCapacity) {
                 if (bytes <= N) {
                     return _make<Array<N>>(0, N / sizeof(Type));
                 }
             }
-            if constexpr(sizeof(Array<N>) < PageDataSize) {
+            if constexpr(sizeof(Array<N>) < PageInfo<Array<N>>::PageCapacity) {
                 constexpr auto Next = (N * 3 / 2 + sizeof(uintptr_t) - 1) & ~(sizeof(uintptr_t) - 1);
                 return _make_array<Next>(bytes);
             } else {
-                constexpr size_t PageArray = PageDataSize - sizeof(ArrayBase);
+                constexpr size_t PageArray = PageDataSize - ArrayDataOffset;
                 if (bytes <= PageArray) {
                     return _make<Array<PageArray>>(0, PageArray / sizeof(Type));
                 }
                 // The large allocator reserves sizeof(Array<PageDataSize>) plus `extra` bytes.
                 using Large = Array<PageDataSize>;
-                const size_t need = sizeof(ArrayBase) + bytes;
+                const size_t need = ArrayDataOffset + bytes;
                 return _make<Array<>>(need > sizeof(Large) ? need - sizeof(Large) : 0, bytes / sizeof(Type));
             }
         }

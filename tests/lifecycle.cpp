@@ -73,6 +73,30 @@ TEST(Lifecycle_Tests, VectorElementAdoptsItselfWhileGrowing) {
     EXPECT_TRUE(collect_until([] { return self_adopting_alive.load() == 0; }));
 }
 
+namespace {
+    struct alignas(16) Aligned16 {
+        double value = 1;
+        tracked_ptr<Aligned16> next;
+    };
+}
+
+// SPEC §8: up to 16-byte alignment, for objects and vector elements alike.
+TEST(Lifecycle_Tests, SixteenByteAlignedTypes) {
+    vector<tracked_ptr<Aligned16>> objects;
+    for (int i = 0; i < 5000; ++i) {
+        auto p = make_tracked<Aligned16>();
+        EXPECT_EQ((uintptr_t)p.get() % 16, 0u);
+        objects.push_back(std::move(p));
+    }
+    vector<Aligned16> elements;
+    for (int i = 0; i < 5000; ++i) {
+        elements.emplace_back();
+        EXPECT_EQ((uintptr_t)&elements.back() % 16, 0u);
+    }
+    settle();
+    EXPECT_EQ(elements[4999].value, 1);
+}
+
 TEST(Lifecycle_Tests, ResizeValueInitializesScalars) {
     vector<long> v{1, 2, 3, 4, 5, 6, 7, 8};
     v.clear();

@@ -9,10 +9,12 @@
 #include "page.h"
 #include "types.h"
 
+#include <cstddef>
 #include <type_traits>
 
 namespace sgcl::detail {
-    static constexpr size_t PageDataSize = config::PageSize - sizeof(uintptr_t);
+    // The slot bytes of a page whatever the type's alignment.
+    inline constexpr size_t PageDataSize = config::PageSize - MaxAlign;
 
     // Whether objects of T may hold a tracked_ptr: one always makes T non-trivially-default-constructible.
     template<class T>
@@ -33,15 +35,20 @@ namespace sgcl::detail {
     struct PageInfo {
         using Type = std::remove_cv_t<T>;
         static constexpr size_t ObjectSize = sizeof(std::remove_extent_t<Type>);
-        static constexpr size_t ObjectCount = std::max(size_t(1), PageDataSize / ObjectSize);
+        // Word 0 of a page holds its header pointer; slots follow at the type's alignment.
+        static constexpr size_t DataOffset = std::max(sizeof(uintptr_t), alignof(std::remove_extent_t<Type>));
+        static constexpr size_t PageCapacity = config::PageSize - DataOffset;
+        static constexpr size_t ObjectCount = std::max(size_t(1), PageCapacity / ObjectSize);
         static constexpr size_t StatesSize = (sizeof(std::atomic<State>) * ObjectCount + sizeof(uintptr_t) - 1) & ~(sizeof(uintptr_t) - 1);
         static constexpr size_t FlagsCount = (ObjectCount + Page::FlagBitCount - 1) / Page::FlagBitCount;
         static constexpr size_t FlagsSize = sizeof(Page::Flags) * FlagsCount;
         static constexpr size_t HeaderSize = sizeof(Page) + StatesSize + FlagsSize;
-        using Allocator = std::conditional_t<ObjectSize <= PageDataSize, ObjectPoolAllocator<Type>, ObjectAllocator<Type>>;
+        using Allocator = std::conditional_t<ObjectSize <= PageCapacity, ObjectPoolAllocator<Type>, ObjectAllocator<Type>>;
 
         static_assert(std::is_nothrow_destructible_v<std::remove_extent_t<Type>>,
                       "managed types must be nothrow-destructible (SPEC.md §3.4)");
+        static_assert(alignof(std::remove_extent_t<Type>) <= MaxAlign,
+                      "managed types are at most 16-byte aligned (SPEC.md §8)");
 
         static constexpr auto get_destroy_function() -> void(*)(void*) noexcept {
             if constexpr (!std::is_trivially_destructible_v<Type>) {

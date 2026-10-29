@@ -23,10 +23,10 @@ namespace sgcl::detail {
             }
         }
 
-        alignas(ArrayBase) char data[Size];
+        alignas(MaxAlign) char data[Size];
     };
 
-    static_assert(sizeof(Array<8>) == sizeof(ArrayBase) + 8, "elements must follow the header directly");
+    static_assert(sizeof(Array<MaxAlign>) == ArrayDataOffset + MaxAlign, "elements start at ArrayDataOffset");
 
     // Storage larger than a page: one large allocation (SPEC.md §4.1).
     template<>

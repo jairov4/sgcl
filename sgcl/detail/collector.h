@@ -359,7 +359,7 @@ namespace sgcl::detail {
                 return;
             }
             // Every element up to capacity: [size, capacity) is zero (SPEC.md §4.8).
-            auto data = (uintptr_t)(array + 1);
+            auto data = (uintptr_t)array + ArrayDataOffset;
             for (size_t i = 0; i < array->capacity; ++i, data += metadata->object_size) {
                 _mark_childs((void*)data, metadata->child_pointers);
             }
@@ -474,7 +474,7 @@ namespace sgcl::detail {
             if (!metadata->child_pointers.size) {
                 return;
             }
-            auto data = (uintptr_t)(array + 1);
+            auto data = (uintptr_t)array + ArrayDataOffset;
             for (size_t i = 0; i < array->size; ++i, data += metadata->object_size) {
                 _clear_childs((void*)data, metadata->child_pointers);
             }

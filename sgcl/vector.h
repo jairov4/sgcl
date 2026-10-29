@@ -20,7 +20,7 @@ namespace sgcl {
     template<class T>
     class vector {
         static_assert(std::is_object_v<T> && !std::is_const_v<T>, "vector elements are non-const object types");
-        static_assert(alignof(T) <= alignof(detail::ArrayBase), "vector elements are at most pointer-aligned (SPEC.md §8)");
+        static_assert(alignof(T) <= detail::MaxAlign, "vector elements are at most 16-byte aligned (SPEC.md §8)");
 
         using Info = detail::TypeInfo<T>;
         using Maker = detail::Maker<T>;

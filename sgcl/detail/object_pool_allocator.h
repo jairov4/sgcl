@@ -31,7 +31,7 @@ namespace sgcl::detail {
 
         Page* _create_page_parameters(DataPage* data) noexcept override {
             auto mem = checked_operator_new(TypeInfo<T>::HeaderSize);
-            return new(mem) Page(data->block, (ValueType*)data->data);
+            return new(mem) Page(data->block, (ValueType*)((char*)data + TypeInfo<T>::DataOffset));
         }
     };
 }

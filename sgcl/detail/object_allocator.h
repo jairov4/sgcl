@@ -27,7 +27,7 @@ namespace sgcl::detail {
         // `size` is the byte count past sizeof(ValueType); the caller checked it for overflow.
         ValueType* alloc(size_t size) const noexcept {
             WakeUpCollectorOnExit wake_up;
-            size += sizeof(ValueType) + sizeof(uintptr_t);
+            size += sizeof(ValueType) + TypeInfo<T>::DataOffset;
             MemoryCounters::update_alloc(1, size);
             auto alloc_counter = MemoryCounters::alloc_counter();
             auto live_counter = MemoryCounters::live_counter();
@@ -35,7 +35,7 @@ namespace sgcl::detail {
                 wake_up.arm();
             }
             auto mem = checked_operator_new(size, std::align_val_t(config::PageSize));
-            auto data = (ValueType*)((uintptr_t)mem + sizeof(uintptr_t));
+            auto data = (ValueType*)((uintptr_t)mem + TypeInfo<T>::DataOffset);
             auto hmem = checked_operator_new(TypeInfo<T>::HeaderSize);
             auto page = new(hmem) Page(nullptr, data);
             page->alloc_size = size;
@@ -52,7 +52,7 @@ namespace sgcl::detail {
                 size_t size = 0;
                 std::vector<void*> mems_to_delete;
                 for (Page* page = pages; page; page = page->next_empty) {
-                    mems_to_delete.push_back((void*)(page->data - sizeof(uintptr_t)));
+                    mems_to_delete.push_back((void*)(page->data & ~(uintptr_t)(config::PageSize - 1)));
                     process_state().pages.remove(mems_to_delete.back());
                     size += page->alloc_size;
                     page->is_used = false;
