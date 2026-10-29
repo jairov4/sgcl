@@ -547,7 +547,7 @@ namespace sgcl::detail {
                 auto flags = page->flags();
                 auto count = page->flags_count();
                 // acquire: the states read below are at least as new as the last barrier on this page.
-                page->state_updated.load(std::memory_order_acquire);
+                (void)page->state_updated.load(std::memory_order_acquire);
                 for (unsigned i = 0; i < count; ++i) {
                     auto& flag = flags[i];
                     auto unreachable = flag.registered & ~flag.marked;
