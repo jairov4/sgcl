@@ -278,8 +278,9 @@ namespace sgcl {
 #ifndef SGCL_ARCH_X86_64
                 _ref = 0;
 #endif
-                // An atomic store, not a constructor: the collector may already trace this storage.
-                std::atomic_ref<void*>(*reinterpret_cast<void**>(&_raw_ptr)).store(nullptr, std::memory_order_relaxed);
+                // An atomic store, not a constructor: the collector may already trace this storage, and reads it
+                // as a RawPointer like every cell.
+                reinterpret_cast<detail::RawPointer*>(&_raw_ptr)->store(nullptr, std::memory_order_relaxed);
                 return true;
             }
             return false;
