@@ -9,672 +9,425 @@
 #include "make_tracked.h"
 #include "tracked_ptr.h"
 
-#include <vector>
+#include <algorithm>
+#include <cstring>
+#include <initializer_list>
+#include <iterator>
 
 namespace sgcl {
+    // SPEC.md §3.5, §4.8, §5.2. Elements [0, size) are constructed and [size, capacity) are zero; storage that
+    // is replaced stays alive while anything refers to it and keeps its moved-from elements until collected.
     template<class T>
     class vector {
-        template<class U>
-        class Iterator {
-        public:
-            using iterator_category = std::random_access_iterator_tag;
-            using value_type = U;
-            using reference = U&;
-            using difference_type = ptrdiff_t;
-            using pointer = U*;
-            using const_pointer = const U*;
-            using const_reference = const U&;
-            using reverse_iterator = std::reverse_iterator<Iterator>;
+        static_assert(std::is_object_v<T> && !std::is_const_v<T>, "vector elements are non-const object types");
+        static_assert(alignof(T) <= detail::MaxAlign, "vector elements are at most 16-byte aligned (SPEC.md §8)");
 
-            Iterator() noexcept
-            : _ptr(nullptr) {
-            }
-
-            explicit Iterator(pointer ptr) noexcept
-            : _ptr(ptr) {
-            }
-
-            reference operator*() const noexcept {
-                return *_ptr;
-            }
-
-            pointer operator->() const noexcept {
-                return _ptr;
-            }
-
-            Iterator& operator++() noexcept {
-                ++_ptr;
-                return *this;
-            }
-
-            Iterator operator++(int) noexcept {
-                Iterator tmp = *this;
-                ++(*this);
-                return tmp;
-            }
-
-            Iterator& operator--() noexcept {
-                --_ptr;
-                return *this;
-            }
-
-            Iterator operator--(int) noexcept {
-                Iterator tmp = *this;
-                --(*this);
-                return tmp;
-            }
-
-            Iterator operator+(difference_type n) const noexcept {
-                return Iterator(_ptr + n);
-            }
-
-            Iterator operator-(difference_type n) const noexcept {
-                return Iterator(_ptr - n);
-            }
-
-            Iterator& operator+=(difference_type n) noexcept {
-                _ptr += n;
-                return *this;
-            }
-
-            Iterator& operator-=(difference_type n) noexcept {
-                _ptr -= n;
-                return *this;
-            }
-
-            difference_type operator-(const Iterator& other) const noexcept {
-                return _ptr - other._ptr;
-            }
-
-            reference operator[](difference_type n) const noexcept {
-                return *(*this + n);
-            }
-
-            reverse_iterator make_reverse_iterator() const noexcept {
-                return reverse_iterator(*this);
-            }
-
-            operator Iterator<const value_type>() const noexcept {
-                return Iterator<const value_type>(_ptr);
-            }
-
-        private:
-            pointer _ptr;
-
-            friend bool operator==(const Iterator& lhs, const Iterator& rhs) noexcept {
-                return lhs._ptr == rhs._ptr;
-            }
-
-            friend std::strong_ordering operator<=>(const Iterator& lhs, const Iterator& rhs) noexcept {
-                return lhs._ptr <=> rhs._ptr;
-            }
-
-            template<class> friend class Iterator;
-            template<class> friend class vector;
-        };
+        using Info = detail::TypeInfo<T>;
+        using Maker = detail::Maker<T>;
+        using Storage = detail::ArrayMaker<T>;
 
     public:
         using value_type = T;
         using reference = T&;
         using const_reference = const T&;
+        using pointer = T*;
+        using const_pointer = const T*;
         using size_type = size_t;
-        using iterator = Iterator<value_type>;
-        using const_iterator = Iterator<const value_type>;
-        using reverse_iterator = typename iterator::reverse_iterator;
-        using const_reverse_iterator = typename const_iterator::reverse_iterator;
         using difference_type = std::ptrdiff_t;
+        using iterator = T*;
+        using const_iterator = const T*;
+        using reverse_iterator = std::reverse_iterator<iterator>;
+        using const_reverse_iterator = std::reverse_iterator<const_iterator>;
 
-        vector() noexcept
-        : _size(nullptr)
-        , _capacity(nullptr) {
+        vector() noexcept = default;
+
+        vector(std::initializer_list<T> init) {
+            _append_copies(init.begin(), init.end(), init.size());
         }
 
-        explicit vector(size_t count) requires std::default_initializable<T>
-        : vector() {
-            if (count) {
-                _make(count);
-            }
-        }
-
-        vector(size_t n, const T& value)
-        : vector() {
-            assign(n, value);
-        }
-
-        vector(std::initializer_list<T> ilist)
-        : vector() {
-            assign(ilist);
-        }
-
-        template<std::input_iterator InputIt>
-        vector(InputIt first, InputIt last)
-        : vector() {
-            assign(first, last);
-        }
-
-        vector(const vector& other)
-        : vector(other.begin(), other.end()) {
+        vector(const vector& other) {
+            _append_copies(other.begin(), other.end(), other.size());
         }
 
         vector(vector&& other) noexcept
-        : _ptr(std::move(other._ptr))
-        , _size(other._size)
-        , _capacity(other._capacity) {
-            other._ptr = nullptr;
-            other._size = nullptr;
-            other._capacity = nullptr;
+        : _data(std::move(other._data)) {
         }
+
+        ~vector() noexcept = default;
 
         vector& operator=(const vector& other) {
             if (this != &other) {
-                assign(other.begin(), other.end());
+                vector copy(other);
+                swap(copy);
             }
             return *this;
         }
 
         vector& operator=(vector&& other) noexcept {
             if (this != &other) {
-                clear();
-                _ptr = other._ptr;
-                _size = other._size;
-                _capacity = other._capacity;
-                other._ptr = nullptr;
-                other._size = nullptr;
-                other._capacity = nullptr;
+                _data = std::move(other._data);
             }
-            return *this;
-        }
-
-        vector& operator=(std::initializer_list<T> ilist) {
-            assign(ilist);
             return *this;
         }
 
         reference operator[](size_t pos) noexcept {
-            return _ptr.get()[pos];
+            return data()[pos];
         }
 
         const_reference operator[](size_t pos) const noexcept {
-            return _ptr.get()[pos];
+            return data()[pos];
         }
 
-        reference at(size_t pos) {
-            if (pos >= size()) {
-                throw std::out_of_range("sgcl::vector");
-            }
-            return _ptr.get()[pos];
+        reference front() noexcept {
+            return data()[0];
         }
 
-        const_reference at(size_t pos) const {
-            if (pos >= size()) {
-                throw std::out_of_range("sgcl::vector");
-            }
-            return _ptr.get()[pos];
+        const_reference front() const noexcept {
+            return data()[0];
+        }
+
+        reference back() noexcept {
+            return data()[size() - 1];
+        }
+
+        const_reference back() const noexcept {
+            return data()[size() - 1];
         }
 
         T* data() noexcept {
-            return _ptr.get();
+            return _data.get();
         }
 
         const T* data() const noexcept {
-            return _ptr.get();
+            return _data.get();
         }
 
-        void assign(size_t n, const T& value) {
-            if (n) {
-                if (capacity() < n) {
-                    clear();
-                    _make(n, value);
-                } else {
-                    size_t i = 0;
-                    auto ptr = begin();
-                    auto s = size();
-                    for (;i < s && i < n; ++i) {
-                        *(ptr + i) = value;
-                    }
-                    auto c = capacity();
-                    for (;i < c && i < n; ++i) {
-                        _construct(ptr + i, value);
-                    }
-                    if (size() > n) {
-                        _destruct(ptr + n, end());
-                    }
-                }
-            } else {
-                clear();
-            }
-        }
-
-        template<std::input_iterator InputIt>
-        void assign(InputIt first, InputIt last) {
-            if (first != last) {
-                size_t n = _distance(first, last);
-                if (n) {
-                    if (capacity() < n) {
-                        clear();
-                        _allocate(n);
-                        auto ptr = _ptr.get();
-                        for (size_t i = 0; i < n; ++i) {
-                            _construct(ptr + i, *first);
-                            ++first;
-                        }
-                    } else {
-                        size_t i = 0;
-                        auto ptr = _ptr.get();
-                        auto s = size();
-                        for (;i < s && i < n; ++i) {
-                            *(ptr + i) = *first;
-                            ++first;
-                        }
-                        auto c = capacity();
-                        for (;i < c && i < n; ++i) {
-                            _construct(ptr + i, *first);
-                            ++first;
-                        }
-                        if (size() > n) {
-                            _destruct(iterator(ptr + n), end());
-                        }
-                    }
-                    return;
-                }
-            }
-            clear();
-        }
-
-        void assign(std::initializer_list<T> ilist) {
-            assign(ilist.begin(), ilist.end());
-        }
-
-        T& front() noexcept {
-            return *_ptr.get();
-        }
-
-        const T& front() const noexcept {
-            return *_ptr.get();
-        }
-
-        T& back() noexcept {
-            return *(_ptr.get() + size() - 1);
-        }
-
-        const T& back() const noexcept {
-            return *(_ptr.get() + size() - 1);
-        }
-
-        iterator begin() noexcept {
-            return iterator(_ptr.get());
-        }
-
-        const_iterator begin() const noexcept {
-            return cbegin();
-        }
-
-        iterator end() noexcept {
-            return begin() + size();
-        }
-
-        const_iterator end() const noexcept {
-            return cend();
-        }
-
-        const_iterator cbegin() const noexcept {
-            return const_iterator(_ptr.get());
-        }
-
-        const_iterator cend() const noexcept {
-            return cbegin() + size();
-        }
-
-        reverse_iterator rbegin() noexcept {
-            return end().make_reverse_iterator();
-        }
-
-        const_reverse_iterator rbegin() const noexcept {
-            return crbegin();
-        }
-
-        reverse_iterator rend() noexcept {
-            return begin().make_reverse_iterator();
-        }
-
-        const_reverse_iterator rend() const noexcept {
-            return crend();
-        }
-
-        const_reverse_iterator crbegin() const noexcept {
-            return cend().make_reverse_iterator();
-        }
-
-        const_reverse_iterator crend() const noexcept {
-            return cbegin().make_reverse_iterator();
-        }
+        iterator begin() noexcept { return data(); }
+        const_iterator begin() const noexcept { return data(); }
+        const_iterator cbegin() const noexcept { return data(); }
+        iterator end() noexcept { return data() + size(); }
+        const_iterator end() const noexcept { return data() + size(); }
+        const_iterator cend() const noexcept { return data() + size(); }
+        reverse_iterator rbegin() noexcept { return reverse_iterator(end()); }
+        const_reverse_iterator rbegin() const noexcept { return const_reverse_iterator(end()); }
+        const_reverse_iterator crbegin() const noexcept { return const_reverse_iterator(end()); }
+        reverse_iterator rend() noexcept { return reverse_iterator(begin()); }
+        const_reverse_iterator rend() const noexcept { return const_reverse_iterator(begin()); }
+        const_reverse_iterator crend() const noexcept { return const_reverse_iterator(begin()); }
 
         bool empty() const noexcept {
             return size() == 0;
         }
 
         size_t size() const noexcept {
-            return _size ? *_size : 0;
+            return _data ? _header()->size : 0;
         }
 
         size_t capacity() const noexcept {
-            return _capacity ? *_capacity : 0;
+            return _data ? _header()->capacity : 0;
         }
 
-        size_type max_size() const noexcept {
-            return std::numeric_limits<ptrdiff_t>::max();
+        static constexpr size_t max_size() noexcept {
+            return Storage::max_capacity();
+        }
+
+        // Strong guarantee.
+        void reserve(size_t n) {
+            if (n > capacity()) {
+                _reallocate(n);
+            }
         }
 
         void push_back(const T& value) {
-            if (!capacity()) {
-                _make(1, value);
-            } else {
-                if (size() >= capacity()) {
-                    _resize();
-                }
-                _construct(end(), value);
-            }
+            emplace_back(value);
         }
 
         void push_back(T&& value) {
-            if (!capacity()) {
-                _make(1, std::move(value));
-            } else {
-                if (size() >= capacity()) {
-                    _resize();
-                }
-                _construct(end(), std::move(value));
-            }
+            emplace_back(std::move(value));
         }
 
-        template<class ...A>
+        // Strong guarantee; the arguments may refer to elements of this vector.
+        template<class... A>
         reference emplace_back(A&&... a) {
-            if (!capacity()) {
-                _make(1, std::forward<A>(a)...);
+            auto s = size();
+            if (s < capacity()) {
+                Maker::construct(data() + s, std::forward<A>(a)...);
+                _header()->size = s + 1;
             } else {
-                if (size() >= capacity()) {
-                    _resize();
-                }
-                _construct(end(), std::forward<A>(a)...);
+                _grow_and_emplace(s, std::forward<A>(a)...);
             }
-            return back();
+            return data()[s];
         }
 
-        void reserve(size_t capacity) {
-            _reserve(capacity);
+        void pop_back() noexcept {
+            _destroy_tail(size() - 1);
         }
 
-        void pop_back() {
-            _destruct(end() - 1);
+        // Strong when T's moves do not throw, else basic. `value` may be an element of this vector.
+        iterator insert(const_iterator pos, const T& value) {
+            return _emplace(pos - cbegin(), value);
+        }
+
+        iterator insert(const_iterator pos, T&& value) {
+            return _emplace(pos - cbegin(), std::move(value));
         }
 
         template<class... A>
         iterator emplace(const_iterator pos, A&&... a) {
-            if (pos == end()) {
-                emplace_back(std::forward<A>(a)...);
-                return --end();
-            } else {
-                auto index = pos - begin();
-                _move(pos, 1);
-                _construct(begin() + index, std::forward<A>(a)...);
-                return begin() + index;
+            return _emplace(pos - cbegin(), std::forward<A>(a)...);
+        }
+
+        // Strong when T's moves do not throw, else basic. The range may be part of this vector.
+        template<std::forward_iterator It>
+        iterator insert(const_iterator pos, It first, It last) {
+            size_t index = pos - cbegin();
+            vector copies;
+            copies._append_copies(first, last, std::distance(first, last));
+            auto n = copies.size();
+            if (n) {
+                _insert_moved(index, n, [&](size_t k) -> T& { return copies.data()[k]; });
             }
+            return begin() + index;
         }
 
-        void insert(size_type count, const T& value) {
-            insert(end(), count, value);
+        // Basic; noexcept when T is nothrow-move-assignable.
+        iterator erase(const_iterator pos) noexcept(std::is_nothrow_move_assignable_v<T>) {
+            return erase(pos, pos + 1);
         }
 
-        iterator insert(const_iterator pos, const T& value) {
-            return emplace(pos, value);
-        }
-
-        iterator insert(const_iterator pos, T&& value) {
-            return emplace(pos, std::move(value));
-        }
-
-        iterator insert(const_iterator pos, size_t count, const T& value) {
-            auto index = pos - begin();
-            if (!count) {
-                return iterator(begin() + index);
-            }
-            if (pos < end()) {
-                _move(pos, count);
-            } else if (size() + count > capacity()) {
-                _resize(size() + count);
-            }
-            auto ptr = _ptr.get() + index;
-            for (size_t i = 0; i < count; ++i) {
-                _construct(ptr + i, value);
-            }
-            return iterator(ptr);
-        }
-
-        template<std::input_iterator InputIt>
-        iterator insert(const_iterator pos, InputIt first, InputIt last) {
-            auto index = pos - begin();
-            if (first == last) {
-                return iterator(begin() + index);
-            }
-            size_t count = _distance(first, last);
-            if (pos < end()) {
-                _move(pos, count);
-            } else if (size() + count > capacity()) {
-                _resize(size() + count);
-            }
-            auto ptr = _ptr.get() + index;
-            for (size_t i = 0; i < count; ++i) {
-                _construct(ptr + i, *first);
-                ++first;
-            }
-            return iterator(ptr);
-        }
-
-        iterator insert(const_iterator pos, std::initializer_list<T> ilist) {
-            return insert(pos, ilist.begin(), ilist.end());
-        }
-
-        iterator erase(const_iterator pos) noexcept {
-            auto index = pos - begin();
-            if (pos < end()) {
-                _move(pos, -1);
-            }
-            return iterator(begin() + index);
-        }
-
-        iterator erase(const_iterator first, const_iterator last) noexcept {
-            auto count = last - first;
-            auto index = first - begin();
-            if (first < end()) {
-                _move(first, -count);
-            }
-            return iterator(begin() + index);
-        }
-
-        void resize(size_type count) requires std::default_initializable<T> {
-            resize(count, T());
-        }
-
-        void resize(size_type count, const value_type& value) {
-            if (count < size()) {
-                _destruct(begin() + count, end());
-            } else if (count > size()) {
-                insert(end(), count - size(), value);
-            }
-        }
-
-        void shrink_to_fit() {
-            if (capacity()) {
-                if (size()) {
-                    auto lock = _ptr;
-                    auto s = size();
-                    auto r = begin();
-                    _allocate(size());
-                    auto l = begin();
-                    for (size_t i = 0; i < s; ++i) {
-                        _construct(l + i, std::move(*(r + i)));
-                    }
-                } else {
-                    clear();
+        iterator erase(const_iterator first, const_iterator last) noexcept(std::is_nothrow_move_assignable_v<T>) {
+            size_t index = first - cbegin();
+            size_t n = last - first;
+            if (n) {
+                auto s = size();
+                auto p = data();
+                for (size_t i = index; i + n < s; ++i) {
+                    p[i] = std::move(p[i + n]);
                 }
+                _destroy_tail(s - n);
+            }
+            return begin() + index;
+        }
+
+        // Strong guarantee.
+        void resize(size_t n) requires std::default_initializable<T> {
+            _resize(n);
+        }
+
+        void resize(size_t n, const T& value) {
+            if (n > size()) {
+                T copy(value);
+                _resize(n, copy);
+            } else {
+                _resize(n);
+            }
+        }
+
+        void clear() noexcept {
+            if (_data) {
+                _destroy_tail(0);
             }
         }
 
         void swap(vector& other) noexcept {
-            _ptr.swap(other._ptr);
-            std::swap(_size, other._size);
-            std::swap(_capacity, other._capacity);
-        }
-
-        void clear() noexcept {
-            vector().swap(*this);
+            _data.swap(other._data);
         }
 
     private:
-        tracked_ptr<T[]> _ptr;
-        size_t* _size;
-        const size_t* _capacity;
+        // Points at element 0 of the storage.
+        tracked_ptr<T> _data;
 
-        template<std::input_iterator InputIt>
-        size_t _distance(InputIt first, InputIt last) const noexcept {
-            auto distance = std::distance(first, last);
-            return distance > 0 ? distance : 0;
+        detail::ArrayBase* _header() const noexcept {
+            return Storage::header_of(_data.get());
         }
 
-        void _allocate(size_t capacity) {
-            _ptr = (unique_ptr<T[]>)(detail::Maker<T[]>::make_tracked_data(capacity));
-            _size = detail::Pointer::size_ptr(_ptr.get());
-            _capacity = detail::Pointer::capacity_ptr(_ptr.get());
+        // Destroys elements [from, size) and zeroes their storage.
+        void _destroy_tail(size_t from) noexcept {
+            auto h = _header();
+            auto p = data();
+            for (size_t i = h->size; i > from; --i) {
+                _destroy_at(p + i - 1);
+            }
+            h->size = from;
         }
 
-        void _make(size_t n) requires std::default_initializable<T> {
-            _ptr = make_tracked<T[]>(n);
-            _size = detail::Pointer::size_ptr(_ptr.get());
-            _capacity = detail::Pointer::capacity_ptr(_ptr.get());
-        }
-
-        template<class ...A>
-        void _make(size_t n, A&&... a) {
-            _ptr = make_tracked<T[]>(n, std::forward<A>(a)...);
-            _size = detail::Pointer::size_ptr(_ptr.get());
-            _capacity = detail::Pointer::capacity_ptr(_ptr.get());
-        }
-
-        template<class ...A>
-        inline void _construct(T* p, A&&... a) {
-            detail::Maker<T>::construct(p, std::forward<A>(a)...);
-            ++(*_size);
-        }
-
-        template<class ...A>
-        inline void _construct(iterator i, A&&... a) {
-            _construct(i._ptr, std::forward<A>(a)...);
-        }
-
-        inline void _destruct(T* p) noexcept(std::is_nothrow_destructible_v<T>) {
-            --(*_size);
-            if constexpr(!std::is_trivially_destructible_v<T> && std::is_destructible_v<T>) {
-                detail::Maker<T>::destroy(p);
+        static void _destroy_at(T* p) noexcept {
+            Maker::destroy(p);
+            if constexpr(Info::MayContainTracked) {
+                std::memset((void*)p, 0, sizeof(T));
             }
         }
 
-        inline void _destruct(iterator i) noexcept(std::is_nothrow_destructible_v<T>) {
-            _destruct(i._ptr);
-        }
-
-        inline void _destruct(T* first, T* last) noexcept(std::is_nothrow_destructible_v<T>) {
-            size_t n = last - first;
-            *_size -= n;
-            if constexpr(!std::is_trivially_destructible_v<T> && std::is_destructible_v<T>) {
-                for (size_t i = n; i > 0; --i) {
-                    detail::Maker<T>::destroy(first + i - 1);
-                }
+        static void _destroy_range(T* first, T* last) noexcept {
+            while (last != first) {
+                _destroy_at(--last);
             }
         }
 
-        inline void _destruct(iterator first, iterator last) noexcept(std::is_nothrow_destructible_v<T>) {
-            _destruct(first._ptr, last._ptr);
+        size_t _grown_capacity(size_t needed) const noexcept {
+            auto c = capacity();
+            auto grown = c <= max_size() / 2 ? std::max(c + c / 2, c + 1) : max_size();
+            return std::max(grown, needed);
         }
 
-        void _resize(size_t capacity = 0, size_t pos = 0, size_t offset = 0) {
-            auto min_capacity = std::max(this->capacity() * 3 / 2, this->capacity() + 1);
-            capacity = std::max(capacity, min_capacity);
-            auto lock = _ptr;
+        // Fresh storage of `n` elements, as a root until it is installed.
+        static unique_ptr<T> _make_storage(size_t n) noexcept {
+            return unique_ptr<T>(Storage::make(n));
+        }
+
+        void _install(unique_ptr<T>& storage, size_t size) noexcept {
+            Storage::header_of(storage.get())->size = size;
+            _data = std::move(storage);
+        }
+
+        // Moves (or copies, std::move_if_noexcept) [0, s) into `dst` leaving a gap of `gap` elements at `pos`.
+        // On a throw the elements built in `dst` are destroyed and the old storage is untouched or, for a
+        // move-only T with a throwing move, partly moved-from.
+        void _relocate_into(T* dst, size_t pos, size_t gap) {
+            auto src = data();
             auto s = size();
-            auto r = begin();
-            _allocate(capacity);
-            auto l = begin();
-            size_t o = 0;
-            for (size_t i = 0; i < s; ++i) {
-                if (i == pos) {
-                    o = offset;
+            size_t i = 0;
+            try {
+                for (; i < s; ++i) {
+                    Maker::construct(dst + (i < pos ? i : i + gap), std::move_if_noexcept(src[i]));
                 }
-                _construct(l + i + o, std::move(*(r + i)));
+            } catch (...) {
+                _destroy_range(dst, dst + std::min(i, pos));
+                if (i > pos) {
+                    _destroy_range(dst + pos + gap, dst + i + gap);
+                }
+                throw;
             }
         }
 
-        void _reserve(size_t capacity) {
-            if (capacity <= this->capacity()) {
-                return;
-            }
-            auto lock = _ptr;
+        void _reallocate(size_t n) {
+            auto storage = _make_storage(n);
             auto s = size();
-            auto r = begin();
-            _allocate(capacity);
-            auto l = begin();
-            for (size_t i = 0; i < s; ++i) {
-                _construct(l + i, std::move(*(r + i)));
-            }
+            _relocate_into(storage.get(), s, 0);
+            _install(storage, s);
         }
 
-        void _move(const_iterator it, ptrdiff_t offset) {
-            size_t pos = it - begin();
+        // The new element is built first, while the arguments still refer to valid objects.
+        template<class... A>
+        void _grow_and_emplace(size_t pos, A&&... a) {
             auto s = size();
-            if (!s) {
-                return;
+            auto storage = _make_storage(_grown_capacity(s + 1));
+            auto dst = storage.get();
+            Maker::construct(dst + pos, std::forward<A>(a)...);
+            try {
+                _relocate_into(dst, pos, 1);
+            } catch (...) {
+                _destroy_at(dst + pos);
+                throw;
             }
-            auto ptr = begin();
-            if (offset > 0) {
-                if (s + offset <= capacity()) {
-                    for (size_t i = s; i > pos; --i) {
-                        auto src = ptr + i - 1;
-                        auto dst = src + offset;
-                        if (i - 1 + offset >= s) {
-                            _construct(dst, std::move(*src));
-                        } else {
-                            *dst = std::move(*src);
-                        }
-                    }
-                    _destruct(ptr + pos, ptr + pos + offset);
-                } else {
-                    _resize(s + offset, pos, offset);
-                }
+            _install(storage, s + 1);
+        }
+
+        template<class... A>
+        iterator _emplace(size_t index, A&&... a) {
+            auto s = size();
+            if (index == s) {
+                emplace_back(std::forward<A>(a)...);
+            } else if (s == capacity()) {
+                _grow_and_emplace(index, std::forward<A>(a)...);
             } else {
-                for (size_t i = pos; i < s + offset; ++i) {
-                    auto dst = ptr + i;
-                    auto src = dst - offset;
-                    *dst = std::move(*src);
+                T value(std::forward<A>(a)...);
+                _insert_moved(index, 1, [&](size_t) -> T& { return value; });
+            }
+            return begin() + index;
+        }
+
+        // Inserts n elements, moved from source(0..n-1), at `index`.
+        template<class Source>
+        void _insert_moved(size_t index, size_t n, Source&& source) {
+            auto s = size();
+            if (s + n > capacity()) {
+                auto storage = _make_storage(_grown_capacity(s + n));
+                auto dst = storage.get();
+                size_t k = 0;
+                try {
+                    for (; k < n; ++k) {
+                        Maker::construct(dst + index + k, std::move_if_noexcept(source(k)));
+                    }
+                    _relocate_into(dst, index, n);
+                } catch (...) {
+                    _destroy_range(dst + index, dst + index + k);
+                    throw;
                 }
-                _destruct(ptr + s + offset, ptr + s);
+                _install(storage, s + n);
+                return;
+            }
+            auto p = data();
+            auto h = _header();
+            // New slots [s, s + n), in order, so size always covers exactly the constructed prefix.
+            for (size_t j = s; j < s + n; ++j) {
+                if (j - n >= index && j >= n) {
+                    Maker::construct(p + j, std::move(p[j - n]));
+                } else {
+                    Maker::construct(p + j, std::move(source(j - index)));
+                }
+                h->size = j + 1;
+            }
+            // Shift the old elements that stay inside the old size, then fill the gap.
+            for (size_t i = s; i-- > index + n;) {
+                p[i] = std::move(p[i - n]);
+            }
+            for (size_t k = 0; k < n && index + k < s; ++k) {
+                p[index + k] = std::move(source(k));
             }
         }
 
-        friend bool operator==(const vector<T>& lhs, const vector<T>& rhs) {
-            return std::equal(lhs.begin(), lhs.end(), rhs.begin());
+        template<class It>
+        void _append_copies(It first, It last, size_t n) {
+            if (!n) {
+                return;
+            }
+            reserve(size() + n);
+            auto p = data();
+            auto h = _header();
+            for (; first != last; ++first) {
+                Maker::construct(p + h->size, *first);
+                ++h->size;
+            }
         }
 
-        friend std::strong_ordering operator<=>(const vector<T>& lhs, const vector<T>& rhs) {
-            return std::lexicographical_compare_three_way(
-                lhs.begin(), lhs.end(),
-                rhs.begin(), rhs.end(),
-                std::compare_three_way{}
-            );
+        template<class... A>
+        void _resize(size_t n, A&... value) {
+            auto s = size();
+            if (n <= s) {
+                if (_data) {
+                    _destroy_tail(n);
+                }
+                return;
+            }
+            if (n > capacity()) {
+                // New elements first, into fresh storage, so a throw leaves this vector as it was.
+                auto storage = _make_storage(n);
+                auto dst = storage.get();
+                size_t i = s;
+                try {
+                    for (; i < n; ++i) {
+                        Maker::construct(dst + i, value...);
+                    }
+                    _relocate_into(dst, s, 0);
+                } catch (...) {
+                    _destroy_range(dst + s, dst + i);
+                    throw;
+                }
+                _install(storage, n);
+                return;
+            }
+            auto p = data();
+            auto h = _header();
+            try {
+                for (size_t i = s; i < n; ++i) {
+                    Maker::construct(p + i, value...);
+                    h->size = i + 1;
+                }
+            } catch (...) {
+                _destroy_tail(s);
+                throw;
+            }
         }
-    };
-
-    template<typename T>
-    class vector<unique_ptr<T>> : public std::vector<unique_ptr<T>> {
-    public:
-        using std::vector<unique_ptr<T>>::vector;
     };
 }

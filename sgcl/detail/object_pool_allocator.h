@@ -14,24 +14,24 @@ namespace sgcl::detail {
         using ValueType = typename TypeInfo<T>::Type;
         using IsPoolAllocator = std::true_type;
 
-        constexpr ObjectPoolAllocator(BlockAllocator& a, std::atomic<Page*>& pages) noexcept
-            : ObjectPoolAllocatorBase(a, pages, _pointer_pool, _pages_buffer) {
+        ObjectPoolAllocator(BlockAllocator& a, std::atomic<Page*>& pages) noexcept
+        : ObjectPoolAllocatorBase(a, pages, _pointer_pool, _pages_buffer) {
         }
 
+        // Collector only.
         static void free(Page* pages) noexcept {
             _free(pages, _pages_buffer);
         }
 
     private:
-        using PointerPool = detail::PointerPool<TypeInfo<T>::ObjectCount, sizeof(std::conditional_t<std::is_void_v<ValueType>, char, ValueType>)>;
-
+        using PointerPool = detail::PointerPool<TypeInfo<T>::ObjectCount, sizeof(ValueType)>;
         PointerPool _pointer_pool;
-        inline static std::atomic<Page*> _pages_buffer = {nullptr};
+        // Per image, like all per-type data: the collector frees a page through its own metadata.
+        inline static PageBuffer _pages_buffer;
 
-        Page* _create_page_parameters(DataPage* data) override {
-            auto mem = ::operator new(TypeInfo<T>::HeaderSize);
-            auto page = new(mem) Page(data->block, (ValueType*)data->data);
-            return page;
+        Page* _create_page_parameters(DataPage* data) noexcept override {
+            auto mem = checked_operator_new(TypeInfo<T>::HeaderSize);
+            return new(mem) Page(data->block, (ValueType*)((char*)data + TypeInfo<T>::DataOffset));
         }
     };
 }

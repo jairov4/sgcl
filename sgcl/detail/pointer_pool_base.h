@@ -31,14 +31,17 @@ namespace sgcl::detail {
             auto count = page->metadata->object_count;
             [[maybe_unused]] bool unused_occur = false;
             for(int i = count - 1; i >= 0; --i) {
-                if (states[i].load(std::memory_order_relaxed) == State::Unused) {
+                // acquire: pairs with the collector's (or another thread's dying allocator's)
+                // release store of State::Unused, so this thread also sees whatever was
+                // sequenced-before that release -- notably the freed object's destructor having
+                // already run -- before handing this memory out again for a new object.
+                if (states[i].load(std::memory_order_acquire) == State::Unused) {
                     _indexes[--_position] = (void*)(data + i * object_size);
                     states[i].store(State::Reserved, std::memory_order_relaxed);
                     ++page->unused_counter_mutators;
                     assert(unused_occur = true);
                 }
             }
-            std::atomic_thread_fence(std::memory_order_release);
             assert(unused_occur);
         }
 

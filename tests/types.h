@@ -9,7 +9,38 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <future>
+#include <thread>
+#include <vector>
+
 using namespace sgcl;
+
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define SGCL_TEST_ASAN 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+#define SGCL_TEST_ASAN 1
+#endif
+#if defined(SGCL_TEST_ASAN)
+#include <sanitizer/asan_interface.h>
+#endif
+
+// Under ASan's detect_stack_use_after_return locals live on a fake stack, where tracked_ptrs are external roots.
+inline bool on_fake_stack() {
+#if defined(SGCL_TEST_ASAN)
+    return __asan_get_current_fake_stack() != nullptr;
+#else
+    return false;
+#endif
+}
 
 struct Bar {
     virtual ~Bar() = default;
@@ -91,6 +122,7 @@ struct Foo : Far, Bar, Faz {
     }
 };
 
+// Counts live instances; destructors of discarded vector storage run on the collector thread.
 struct Int {
     Int() noexcept
     : _value(0) {
@@ -111,7 +143,7 @@ struct Int {
         --counter;
     }
 
-    Int operator=(Int other) noexcept {
+    Int& operator=(const Int& other) noexcept {
         _value = other._value;
         return *this;
     }
@@ -121,15 +153,68 @@ struct Int {
     }
 
     bool operator==(int value) const noexcept {
-        return (_value <=> value) == 0;
+        return _value == value;
     }
 
-    std::strong_ordering operator<=>(int value) const noexcept {
-        return (_value <=> value);
+    static size_t live() noexcept {
+        return counter.load();
     }
 
-    inline static size_t counter = 0;
+    inline static std::atomic<size_t> counter = 0;
 
 private:
     int _value;
 };
+
+// A referent with its own live counter per Tag, so tests do not observe each other's garbage.
+template<class Tag>
+struct Probe {
+    explicit Probe(int v = 0) noexcept
+    : value(v) {
+        ++constructed;
+    }
+
+    ~Probe() {
+        ++destroyed;
+    }
+
+    static long alive() noexcept {
+        return constructed.load() - destroyed.load();
+    }
+
+    int value;
+    inline static std::atomic<long> constructed = 0;
+    inline static std::atomic<long> destroyed = 0;
+};
+
+struct Boom {};
+
+// Collects until `done()` holds, at most `cycles` forced collections; returns `done()`.
+inline bool collect_until(const std::function<bool()>& done, int cycles = 20) {
+    for (int i = 0; i < cycles && !done(); ++i) {
+        collector::force_collect(true);
+    }
+    return done();
+}
+
+// Two full cycles: everything unreachable before the call and not kept by a finalizer is gone.
+inline void settle() {
+    collector::force_collect(true);
+    collector::force_collect(true);
+}
+
+// Runs `f` on another thread; a timeout fails the test and ends the process instead of hanging it.
+inline void run_with_timeout(std::function<void()> f, std::chrono::milliseconds timeout, const char* what) {
+    std::promise<void> done;
+    auto finished = done.get_future();
+    std::thread worker([&] {
+        f();
+        done.set_value();
+    });
+    if (finished.wait_for(timeout) != std::future_status::ready) {
+        ADD_FAILURE() << what << " did not finish within " << timeout.count() << " ms";
+        std::fflush(stdout);
+        std::_Exit(1);
+    }
+    worker.join();
+}

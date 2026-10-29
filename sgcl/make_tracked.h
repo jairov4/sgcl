@@ -9,31 +9,11 @@
 #include "unique_ptr.h"
 
 namespace sgcl {
-    template<class T, class ...A, std::enable_if_t<!std::is_array_v<T> && !std::is_void_v<T>, int> = 0>
-    auto make_tracked(A&&... a) {
-        static_assert(sizeof(detail::Array<sizeof(T)>) <= detail::PageDataSize, "Object is too large");
-        auto ptr = detail::Maker<T>::make_tracked(std::forward<A>(a)...);
-        return unique_ptr<T>(std::move(ptr));
-    }
-
-    template<class T, std::enable_if_t<std::is_array_v<T>, int> = 0>
-    auto make_tracked(size_t size) {
-        static_assert(sizeof(detail::Array<sizeof(std::remove_extent_t<T>)>) <= detail::PageDataSize, "Object is too large");
-        auto ptr = detail::Maker<T>::make_tracked(size);
-        return unique_ptr<T>(std::move(ptr));
-    }
-
-    template<class T, class ...A, std::enable_if_t<std::is_array_v<T>, int> = 0>
-    auto make_tracked(size_t size, A&&... a) {
-        static_assert(sizeof(detail::Array<sizeof(std::remove_extent_t<T>)>) <= detail::PageDataSize, "Object is too large");
-        auto ptr = detail::Maker<T>::make_tracked(size, std::forward<A>(a)...);
-        return unique_ptr<T>(std::move(ptr));
-    }
-
-    template<class T, std::enable_if_t<std::is_array_v<T>, int> = 0>
-    auto make_tracked(std::initializer_list<std::remove_extent_t<T>> init) {
-        static_assert(sizeof(detail::Array<sizeof(std::remove_extent_t<T>)>) <= detail::PageDataSize, "Object is too large");
-        auto ptr = detail::Maker<T>::make_tracked(init);
-        return unique_ptr<T>(std::move(ptr));
+    // SPEC.md §3.1.
+    template<class T, class... A>
+        requires (std::is_object_v<T> && !std::is_array_v<T>)
+    unique_ptr<T> make_tracked(A&&... a) {
+        static_assert(sizeof(T) <= detail::PageInfo<T>::PageCapacity, "object is too large (SPEC.md §8)");
+        return unique_ptr<T>(detail::Maker<T>::make_tracked(std::forward<A>(a)...));
     }
 }

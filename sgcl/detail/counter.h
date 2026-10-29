@@ -28,8 +28,8 @@ namespace sgcl::detail {
             size += c.size;
         }
         void operator-=(const Counter& c) noexcept {
-            count += c.count;
-            size += c.size;
+            count -= c.count;
+            size -= c.size;
         }
         void operator*=(size_t v) noexcept {
             count *= v;

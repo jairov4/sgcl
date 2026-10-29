@@ -7,6 +7,7 @@
 
 #include "../config.h"
 #include "data_page.h"
+#include "fatal.h"
 #include <new>
 
 namespace sgcl::detail {
@@ -20,12 +21,9 @@ namespace sgcl::detail {
             }
         }
 
-        static void* operator new(size_t) {
+        static void* operator new(size_t) noexcept {
             constexpr size_t size = sizeof(void*) + sizeof(Block) + sizeof(DataPage) * (PageCount + 1);
-            void* mem = malloc(size);
-            if (!mem) {
-                throw std::bad_alloc();
-            }
+            void* mem = checked_malloc(size);
             uintptr_t addres = (uintptr_t)mem + sizeof(void*) + sizeof(Block) + config::PageSize;
             addres = addres & ~(config::PageSize - 1);
             Block* block = (Block*)addres - 1;
@@ -34,7 +32,7 @@ namespace sgcl::detail {
         }
 
         static void operator delete(void* p, size_t) noexcept {
-            free(*((void**)p - 1));
+            std::free(*((void**)p - 1));
         }
 
         Block* next = {nullptr};

@@ -8,23 +8,24 @@
 #include "detail/collector.h"
 
 namespace sgcl {
+    // SPEC.md §3.7.
     class collector {
     public:
         using pause_guard = detail::Collector::PauseGuard;
 
-        inline static size_t get_live_object_count() {
-            return std::get<1>(get_live_objects()).size();
-        }
-
-        inline static std::tuple<pause_guard, std::vector<void*>> get_live_objects() {
-            return detail::collector_instance().get_live_objects();
-        }
-
-        inline static bool force_collect(bool wait = false) noexcept {
+        static bool force_collect(bool wait = false) noexcept {
             return detail::collector_instance().force_collect(wait);
         }
 
-        inline static void terminate() noexcept {
+        static size_t get_live_object_count() noexcept {
+            return detail::Collector::created() ? detail::collector_instance().live_object_count() : 0;
+        }
+
+        static std::tuple<pause_guard, std::vector<void*>> get_live_objects() noexcept {
+            return detail::collector_instance().get_live_objects();
+        }
+
+        static void terminate() noexcept {
             detail::Collector::terminate();
         }
     };
