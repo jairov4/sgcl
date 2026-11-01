@@ -374,3 +374,39 @@ TEST(UnorderedMap_Test, KeyEqualOnlyOnEqualHashes) {
     EXPECT_TRUE(Calls::argument_second);
     Calls::modulus = 0;
 }
+
+TEST(UnorderedMap_Test, DrainFromTheFrontAndReinsertBehindIt) {
+    sgcl::unordered_map<int, int> map;
+    for (int i = 0; i < 1000; ++i) {
+        map.insert_or_assign(i, i);
+    }
+    std::set<int> seen;
+    for (int i = 0; i < 600; ++i) {
+        auto it = map.begin();
+        ASSERT_NE(it, map.end());
+        seen.insert(it->first);
+        EXPECT_EQ(map.erase(it->first), 1u);
+    }
+    EXPECT_EQ(seen.size(), 600u);
+    // Keys land in buckets below the ones the drain has passed: begin() must find them again.
+    for (int i = 1000; i < 1100; ++i) {
+        map.insert_or_assign(i, i);
+    }
+    size_t visited = 0;
+    for (auto it = map.begin(); it != map.end(); ++it) {
+        EXPECT_EQ(seen.count(it->first), 0u);
+        ++visited;
+    }
+    EXPECT_EQ(visited, map.size());
+    while (!map.empty()) {
+        ASSERT_NE(map.begin(), map.end());
+        map.erase(map.begin()->first);
+    }
+    EXPECT_EQ(map.begin(), map.end());
+    map.insert_or_assign(7, 7);
+    EXPECT_EQ(map.begin()->first, 7);
+    const auto& cmap = map;
+    EXPECT_EQ(cmap.begin()->first, 7);
+    map.clear();
+    EXPECT_EQ(map.begin(), map.end());
+}

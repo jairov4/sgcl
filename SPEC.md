@@ -387,7 +387,8 @@ moved-from elements. Element destructors of discarded storage run on the collect
 
 **`unordered_map`** holds a `vector<tracked_ptr<Node>>` of buckets and a size; a `Node` is `{value_type, hash, next}`
 in its own managed allocation. Maximum load factor 0.75, at least 8 buckets once non-empty; a rehash relinks the
-existing nodes using their stored hashes and never allocates a node.
+existing nodes using their stored hashes and never allocates a node. `begin()` starts at the first bucket that may be
+non-empty (a hint lowered by an insertion and advanced by `begin()`), so draining a map from the front is linear.
 
 ### 4.9 Process state
 

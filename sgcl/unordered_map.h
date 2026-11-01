@@ -126,12 +126,19 @@ namespace sgcl {
         unordered_map& operator=(const unordered_map&) = delete;
         ~unordered_map() noexcept = default;
 
+        // Buckets below `_first` are empty, so a map drained from the front (`erase(begin()->first)` in a loop)
+        // does not rescan the buckets it has already emptied: buckets never shrink.
         iterator begin() noexcept {
-            return _buckets.empty() ? end() : iterator(this, 0, _buckets[0]);
+            if (_buckets.empty()) {
+                return end();
+            }
+            iterator it(this, _first, _buckets[_first]);
+            _first = it._bucket_index < _buckets.size() ? it._bucket_index : _buckets.size() - 1;
+            return it;
         }
 
         const_iterator begin() const noexcept {
-            return _buckets.empty() ? end() : const_iterator(this, 0, _buckets[0]);
+            return _buckets.empty() ? end() : const_iterator(this, _first, _buckets[_first]);
         }
 
         const_iterator cbegin() const noexcept {
@@ -161,6 +168,7 @@ namespace sgcl {
         void clear() noexcept {
             _buckets = vector<NodePtr>();
             _size = 0;
+            _first = 0;
         }
 
         template<class M>
@@ -209,6 +217,7 @@ namespace sgcl {
 
         vector<NodePtr> _buckets;
         size_t _size = 0;
+        size_t _first = 0;  // every bucket below it is empty
         [[no_unique_address]] Hash _hash;
         [[no_unique_address]] KeyEqual _equal;
 
@@ -243,6 +252,9 @@ namespace sgcl {
             NodePtr inserted(std::move(node));
             _buckets[index] = inserted;
             ++_size;
+            if (index < _first) {
+                _first = index;
+            }
             return {iterator(this, index, inserted), true};
         }
 
@@ -270,6 +282,7 @@ namespace sgcl {
                 }
             }
             _buckets = std::move(buckets);
+            _first = 0;
         }
 
         static void _resize_buckets(vector<NodePtr>& buckets, size_t count) noexcept {
