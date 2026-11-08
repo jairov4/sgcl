@@ -261,7 +261,11 @@ namespace sgcl {
     public:
         using element_type = T;
 
-        tracked_ptr() noexcept = default;
+        // User-provided, not defaulted: `: tracked_ptr()` in the other constructors would otherwise value-initialize,
+        // zeroing the cell before the base constructor reads the layout-discovery sentinel (SPEC.md §4.4).
+        tracked_ptr() noexcept
+        : Base() {
+        }
 
         tracked_ptr(std::nullptr_t) noexcept
         : tracked_ptr() {
