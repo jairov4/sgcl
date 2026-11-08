@@ -10,12 +10,12 @@
 namespace sgcl::detail {
     // Describes the element type of a vector's storage.
     struct ArrayMetadata {
-        template<class T>
-        ArrayMetadata(T*) noexcept
-        : child_pointers(TypeInfo<T>::child_pointers())
-        , destroy(ArrayBase::get_destroy_function<T>())
-        , object_size(TypeInfo<T>::ObjectSize)
-        , tracked_ptrs_only(TypeInfo<T>::IsTracked) {
+        ArrayMetadata(ChildPointers& child_pointers, void (*destroy)(void*, size_t) noexcept, size_t object_size,
+                      bool tracked_ptrs_only) noexcept
+        : child_pointers(child_pointers)
+        , destroy(destroy)
+        , object_size(object_size)
+        , tracked_ptrs_only(tracked_ptrs_only) {
         }
 
         ChildPointers& child_pointers;

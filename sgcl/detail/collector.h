@@ -624,7 +624,7 @@ namespace sgcl::detail {
 
             bool possible_empty_blocks = metadata != nullptr;
             while(metadata) {
-                metadata->free(metadata->empty_page);
+                metadata->free(metadata->empty_page, *metadata);
                 metadata->used = false;
                 metadata->empty_page = nullptr;
                 metadata = metadata->next;

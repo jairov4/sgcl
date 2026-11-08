@@ -39,9 +39,7 @@ namespace sgcl::detail {
     template<class>
     class  ObjectAllocator;
     class  ObjectAllocatorBase;
-    template<class>
     class  ObjectPoolAllocator;
-    class  ObjectPoolAllocatorBase;
     struct Page;
     template<class>
     struct PageInfo;

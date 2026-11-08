@@ -88,7 +88,16 @@ namespace sgcl::detail {
 
         template<class T>
         auto& alocator() noexcept {
-            return _allocator<typename TypeInfo<T>::Allocator>();
+            using Allocator = typename TypeInfo<T>::Allocator;
+            auto& alocator = _allocators[_type_index<typename TypeInfo<T>::Type>()];
+            if (!alocator) [[unlikely]] {
+                if constexpr(Allocator::IsPoolAllocator::value) {
+                    alocator = checked_new<Allocator>(*_block_allocator, _data->pages, TypeInfo<T>::private_metadata());
+                } else {
+                    alocator = checked_new<Allocator>(_data->pages);
+                }
+            }
+            return static_cast<Allocator&>(*alocator);
         }
 
         ConstructionGuard use_construction(Construction c) noexcept {
@@ -103,19 +112,6 @@ namespace sgcl::detail {
         BlockAllocator* const _block_allocator;
         std::array<ObjectAllocatorBase*, config::MaxTypesNumber> _allocators = {};
         Data* const _data;
-
-        template<class Allocator>
-        Allocator& _allocator() noexcept {
-            auto& alocator = _allocators[_type_index<typename Allocator::ValueType>()];
-            if (!alocator) {
-                if constexpr(Allocator::IsPoolAllocator::value) {
-                    alocator = checked_new<Allocator>(*_block_allocator, _data->pages);
-                } else {
-                    alocator = checked_new<Allocator>(_data->pages);
-                }
-            }
-            return static_cast<Allocator&>(*alocator);
-        }
 
         // Cached per image; the counter is process-wide, so types of different images never share a slot.
         template<class T>

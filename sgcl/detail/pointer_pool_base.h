@@ -61,6 +61,10 @@ namespace sgcl::detail {
             _indexes[--_position] = p;
         }
 
+        void** indexes() const noexcept {
+            return _indexes;
+        }
+
     private:
         void** const _indexes;
         const unsigned _size;

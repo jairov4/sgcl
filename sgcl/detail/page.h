@@ -27,9 +27,8 @@ namespace sgcl::detail {
             Flag finalized = {0};
         };
 
-        template<class T>
-        Page(Block* block, T* data) noexcept
-        : metadata(&Info<T>::private_metadata())
+        Page(Block* block, void* data, Metadata* metadata) noexcept
+        : metadata(metadata)
         , block(block)
         , data((uintptr_t)data)
         , multiplier((1ull << 32 | 0x10000) / metadata->object_size)

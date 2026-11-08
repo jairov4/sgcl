@@ -43,7 +43,8 @@ namespace sgcl::detail {
         static constexpr size_t FlagsCount = (ObjectCount + Page::FlagBitCount - 1) / Page::FlagBitCount;
         static constexpr size_t FlagsSize = sizeof(Page::Flags) * FlagsCount;
         static constexpr size_t HeaderSize = sizeof(Page) + StatesSize + FlagsSize;
-        using Allocator = std::conditional_t<ObjectSize <= PageCapacity, ObjectPoolAllocator<Type>, ObjectAllocator<Type>>;
+        static constexpr bool Pooled = ObjectSize <= PageCapacity;
+        using Allocator = std::conditional_t<Pooled, ObjectPoolAllocator, ObjectAllocator<Type>>;
 
         static_assert(std::is_nothrow_destructible_v<std::remove_extent_t<Type>>,
                       "managed types must be nothrow-destructible (SPEC.md §3.4)");
@@ -73,12 +74,19 @@ namespace sgcl::detail {
         // after static destruction. Function-local statics, so a construction during static initialization of
         // another translation unit finds them built.
         inline static Metadata& private_metadata() noexcept {
-            static auto metadata = checked_new<Metadata>((std::remove_extent_t<Type>*)0);
+            // Constants, so an unoptimized build emits no function for them.
+            static constexpr auto destroy = get_destroy_function();
+            static constexpr auto finalize = get_finalize_function();
+            static auto metadata = checked_new<Metadata>(
+                child_pointers(), destroy, finalize, &Allocator::free, ObjectSize,
+                (unsigned)ObjectCount, std::is_base_of_v<ArrayBase, std::remove_extent_t<Type>>, DataOffset, HeaderSize);
             return *metadata;
         }
 
         inline static ArrayMetadata& array_metadata() noexcept {
-            static auto metadata = checked_new<ArrayMetadata>((std::remove_extent_t<Type>*)0);
+            static auto metadata = checked_new<ArrayMetadata>(
+                child_pointers(), ArrayBase::get_destroy_function<Type>(), ObjectSize,
+                std::is_base_of_v<Tracked, std::remove_extent_t<Type>>);
             return *metadata;
         }
 

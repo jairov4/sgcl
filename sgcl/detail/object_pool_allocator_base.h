@@ -6,27 +6,33 @@
 #pragma once
 
 #include "block_allocator.h"
+#include "fatal.h"
 #include "object_allocator_base.h"
+#include "pointer_pool_base.h"
 
 namespace sgcl::detail {
-    // A type's partly free pages, shared by every thread. Mutators pop, the collector replaces the list; both
-    // under the lock (a CAS pop is ABA-prone against the collector's re-sorting).
-    struct PageBuffer {
-        Page* head = {nullptr};
-        SpinLock lock;
-    };
-
-    class ObjectPoolAllocatorBase : public ObjectAllocatorBase {
+    // One thread's allocator of one pooled type (PageInfo<T>::Pooled). Not a template: everything it needs of the
+    // type is in the type's Metadata, so the code is shared by every type.
+    class ObjectPoolAllocator : public ObjectAllocatorBase {
     public:
-        ObjectPoolAllocatorBase(BlockAllocator& ba, std::atomic<Page*>& pages, PointerPoolBase& pa, PageBuffer& pb) noexcept
+        using IsPoolAllocator = std::true_type;
+
+        ObjectPoolAllocator(BlockAllocator& ba, std::atomic<Page*>& pages, Metadata& metadata) noexcept
         : ObjectAllocatorBase(pages)
         , _block_allocator(ba)
-        , _pointer_pool(pa)
-        , _pages_buffer(pb) {
+        , _metadata(metadata)
+        , _pointer_pool((void**)checked_operator_new(sizeof(void*) * metadata.object_count), metadata.object_count,
+                        (unsigned)metadata.object_size)
+        , _pages_buffer(metadata.pages_buffer) {
+        }
+
+        // Collector only.
+        static void free(Page* pages, Metadata& metadata) noexcept {
+            _free(pages, metadata.pages_buffer);
         }
 
         // At thread exit: return the slots still in the pool.
-        ~ObjectPoolAllocatorBase() noexcept override {
+        ~ObjectPoolAllocator() noexcept override {
             unsigned unused_counter = 0;
             while (!_pointer_pool.is_empty()) {
                 auto ptr = _pointer_pool.alloc();
@@ -40,6 +46,7 @@ namespace sgcl::detail {
                 // release: pairs with _release_unused_pages' acquire load of this counter.
                 _current_page->unused_atomic.fetch_add(unused_counter, std::memory_order_release);
             }
+            ::operator delete(_pointer_pool.indexes());
         }
 
         void* alloc() noexcept {
@@ -69,11 +76,15 @@ namespace sgcl::detail {
 
     private:
         BlockAllocator& _block_allocator;
-        PointerPoolBase& _pointer_pool;
+        Metadata& _metadata;
+        PointerPoolBase _pointer_pool;
         PageBuffer& _pages_buffer;
         Page* _current_page = {nullptr};
 
-        virtual Page* _create_page_parameters(DataPage*) noexcept = 0;
+        Page* _create_page_parameters(DataPage* data) noexcept {
+            auto mem = checked_operator_new(_metadata.header_size);
+            return new(mem) Page(data->block, (char*)data + _metadata.data_offset, &_metadata);
+        }
 
         Page* _alloc_page() noexcept {
             auto data = _block_allocator.alloc();

@@ -108,39 +108,13 @@ namespace sgcl::detail {
         }
     };
 
-    // The storage of a vector: `capacity` zeroed elements of T, none constructed (SPEC.md §4.8).
-    template<class T>
-    class ArrayMaker {
-        using Info = TypeInfo<T>;
-        using Type = typename Info::Type;
-
+    // Size classes grow from one word by 3/2 up to a page; beyond that the storage is a large allocation. Not a
+    // template on the element type, so the chain is compiled once, not once per element type.
+    class ArrayStorage {
     public:
-        static constexpr size_t max_capacity() noexcept {
-            return (SIZE_MAX - ArrayDataOffset - 2 * config::PageSize) / sizeof(Type);
-        }
-
-        // Returns the address of element 0; the slot is UniqueLock. `capacity` may be rounded up to the size
-        // class. A capacity beyond max_capacity() is fatal.
-        static UniquePtr<T> make(size_t capacity) noexcept {
-            assert(capacity > 0);
-            if (capacity > max_capacity()) {
-                fatal("container size overflow");
-            }
-            ArrayBase* array = _make_array(capacity * sizeof(Type));
-            if constexpr(Info::MayContainTracked) {
-                std::memset(data_of(array), 0, sizeof(Type) * array->capacity);
-            }
-            // release: the zeroed elements are published before the collector traces them.
-            array->metadata.store(&Info::array_metadata(), std::memory_order_release);
-            return UniquePtr<T>((T*)data_of(array));
-        }
-
-        static void* data_of(ArrayBase* array) noexcept {
-            return (char*)array + ArrayDataOffset;
-        }
-
-        static ArrayBase* header_of(const void* data) noexcept {
-            return (ArrayBase*)((const char*)data - ArrayDataOffset);
+        // A UniqueLock slot of at least `bytes` bytes of elements of `element_size` bytes.
+        static ArrayBase* make(size_t bytes, size_t element_size) noexcept {
+            return _make_array<sizeof(uintptr_t)>(bytes, element_size);
         }
 
     private:
@@ -159,27 +133,62 @@ namespace sgcl::detail {
             return (ArrayBase*)mem;
         }
 
-        // Size classes grow from one word by 3/2 up to a page; beyond that the storage is a large allocation.
-        template<size_t N = sizeof(uintptr_t)>
-        static ArrayBase* _make_array(size_t bytes) noexcept {
+        template<size_t N>
+        static ArrayBase* _make_array(size_t bytes, size_t element_size) noexcept {
             if constexpr(sizeof(Array<N>) <= PageInfo<Array<N>>::PageCapacity) {
                 if (bytes <= N) {
-                    return _make<Array<N>>(0, N / sizeof(Type));
+                    return _make<Array<N>>(0, N / element_size);
                 }
             }
             if constexpr(sizeof(Array<N>) < PageInfo<Array<N>>::PageCapacity) {
                 constexpr auto Next = (N * 3 / 2 + sizeof(uintptr_t) - 1) & ~(sizeof(uintptr_t) - 1);
-                return _make_array<Next>(bytes);
+                return _make_array<Next>(bytes, element_size);
             } else {
                 constexpr size_t PageArray = PageDataSize - ArrayDataOffset;
                 if (bytes <= PageArray) {
-                    return _make<Array<PageArray>>(0, PageArray / sizeof(Type));
+                    return _make<Array<PageArray>>(0, PageArray / element_size);
                 }
                 // The large allocator reserves sizeof(Array<PageDataSize>) plus `extra` bytes.
                 using Large = Array<PageDataSize>;
                 const size_t need = ArrayDataOffset + bytes;
-                return _make<Array<>>(need > sizeof(Large) ? need - sizeof(Large) : 0, bytes / sizeof(Type));
+                return _make<Array<>>(need > sizeof(Large) ? need - sizeof(Large) : 0, bytes / element_size);
             }
+        }
+    };
+
+    // The storage of a vector: `capacity` zeroed elements of T, none constructed (SPEC.md §4.8).
+    template<class T>
+    class ArrayMaker {
+        using Info = TypeInfo<T>;
+        using Type = typename Info::Type;
+
+    public:
+        static constexpr size_t max_capacity() noexcept {
+            return (SIZE_MAX - ArrayDataOffset - 2 * config::PageSize) / sizeof(Type);
+        }
+
+        // Returns the address of element 0; the slot is UniqueLock. `capacity` may be rounded up to the size
+        // class. A capacity beyond max_capacity() is fatal.
+        static UniquePtr<T> make(size_t capacity) noexcept {
+            assert(capacity > 0);
+            if (capacity > max_capacity()) {
+                fatal("container size overflow");
+            }
+            ArrayBase* array = ArrayStorage::make(capacity * sizeof(Type), sizeof(Type));
+            if constexpr(Info::MayContainTracked) {
+                std::memset(data_of(array), 0, sizeof(Type) * array->capacity);
+            }
+            // release: the zeroed elements are published before the collector traces them.
+            array->metadata.store(&Info::array_metadata(), std::memory_order_release);
+            return UniquePtr<T>((T*)data_of(array));
+        }
+
+        static void* data_of(ArrayBase* array) noexcept {
+            return (char*)array + ArrayDataOffset;
+        }
+
+        static ArrayBase* header_of(const void* data) noexcept {
+            return (ArrayBase*)((const char*)data - ArrayDataOffset);
         }
     };
 }

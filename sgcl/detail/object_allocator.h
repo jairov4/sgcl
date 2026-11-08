@@ -37,7 +37,7 @@ namespace sgcl::detail {
             auto mem = checked_operator_new(size, std::align_val_t(config::PageSize));
             auto data = (ValueType*)((uintptr_t)mem + TypeInfo<T>::DataOffset);
             auto hmem = checked_operator_new(TypeInfo<T>::HeaderSize);
-            auto page = new(hmem) Page(nullptr, data);
+            auto page = new(hmem) Page(nullptr, data, &TypeInfo<T>::private_metadata());
             page->alloc_size = size;
             *((Page**)mem) = page;
             process_state().pages.add(mem);
@@ -47,7 +47,7 @@ namespace sgcl::detail {
         }
 
         // Collector only.
-        static void free(Page* pages) noexcept {
+        static void free(Page* pages, Metadata&) noexcept {
             or_fatal([&] {
                 size_t size = 0;
                 std::vector<void*> mems_to_delete;
