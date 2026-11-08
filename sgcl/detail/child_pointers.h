@@ -19,23 +19,11 @@ namespace sgcl::detail {
     struct ChildPointers {
         static constexpr size_t WordsPerByte = 8;
 
-        ChildPointers(bool final_layout, size_t object_size) noexcept
-        : final(final_layout)
-        , size(final_layout ? 0 : ((object_size + sizeof(RawPointer) - 1) / sizeof(RawPointer) + WordsPerByte - 1) / WordsPerByte)
-        , map(size ? static_cast<std::atomic<uint8_t>*>(checked_operator_new(size)) : nullptr) {
-            for (size_t i = 0; i < size; ++i) {
-                new (&map[i]) std::atomic<uint8_t>(0);
-            }
-        }
+        SGCL_API ChildPointers(bool final_layout, size_t object_size) noexcept;
 
         // The layout of an external-root cell: one child, at offset 0.
         struct CellTag {};
-        explicit ChildPointers(CellTag) noexcept
-        : final(true)
-        , size(1)
-        , map(static_cast<std::atomic<uint8_t>*>(checked_operator_new(1))) {
-            new (&map[0]) std::atomic<uint8_t>(1);
-        }
+        SGCL_API explicit ChildPointers(CellTag) noexcept;
 
         ChildPointers(const ChildPointers&) = delete;
         ChildPointers& operator=(const ChildPointers&) = delete;

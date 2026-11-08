@@ -27,22 +27,7 @@ namespace sgcl::detail {
             Flag finalized = {0};
         };
 
-        Page(Block* block, void* data, Metadata* metadata) noexcept
-        : metadata(metadata)
-        , block(block)
-        , data((uintptr_t)data)
-        , multiplier((1ull << 32 | 0x10000) / metadata->object_size)
-        , object_count(metadata->object_count) {
-            assert(data != nullptr);
-            auto states = this->states();
-            for (unsigned i = 0; i < metadata->object_count; ++i) {
-                new (&states[i]) std::atomic<State>(State::Reserved);
-            }
-            auto flags = this->flags();
-            for (unsigned i = 0; i < flags_count(); ++i) {
-                new (&flags[i]) Flags();
-            }
-        }
+        SGCL_API Page(Block* block, void* data, Metadata* metadata) noexcept;
 
         // Placement-constructed in a block of TypeInfo<T>::HeaderSize bytes from the unsized ::operator new, so
         // `delete page` must use the matching unsized form.

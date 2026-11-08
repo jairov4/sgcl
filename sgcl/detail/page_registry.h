@@ -82,27 +82,7 @@ namespace sgcl::detail {
             uint64_t bit;
         };
 
-        Location _locate(const void* p, bool create) noexcept {
-            auto page = (uintptr_t)p >> PageBits;
-            if (page >> (AddressBits - PageBits)) {
-                fatal("managed memory above the 48-bit address space");
-            }
-            auto& slot = _root[page >> LeafBits];
-            auto leaf = slot.load(std::memory_order_acquire);
-            if (!leaf && create) {
-                auto fresh = (std::atomic<uint64_t>*)checked_operator_new(sizeof(std::atomic<uint64_t>) * LeafWords);
-                for (size_t i = 0; i < LeafWords; ++i) {
-                    new (&fresh[i]) std::atomic<uint64_t>(0);
-                }
-                if (slot.compare_exchange_strong(leaf, fresh, std::memory_order_acq_rel, std::memory_order_acquire)) {
-                    leaf = fresh;
-                } else {
-                    ::operator delete(fresh);
-                }
-            }
-            auto index = page & ((size_t(1) << LeafBits) - 1);
-            return {leaf, index / 64, uint64_t(1) << (index % 64)};
-        }
+        SGCL_API Location _locate(const void* p, bool create) noexcept;
 
         std::atomic<std::atomic<uint64_t>*> _root[RootSize] = {};
     };

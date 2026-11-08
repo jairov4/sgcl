@@ -48,126 +48,21 @@ namespace sgcl::detail {
             free(pages, true);
         }
 
-        DataPage* alloc() noexcept {
-            WakeUpCollectorOnExit wake_up;
-            MemoryCounters::update_alloc(1, config::PageSize);
-            if (MemoryCounters::alloc_count() * 4 > MemoryCounters::live_count() + 64) {
-                wake_up.arm();
-            }
-            if (_pointer_pool.is_empty()) {
-                auto& state = process_state();
-                {
-                    SpinLockGuard guard(state.empty_pages_lock);
-                    if (auto page = state.empty_pages) {
-                        state.empty_pages = page->next;
-                        return page;
-                    }
-                }
-                auto block = new Block;
-                _pointer_pool.fill(block + 1);
-            }
-            return (DataPage*)_pointer_pool.alloc();
-        }
+        SGCL_API DataPage* alloc() noexcept;
 
         // Collector only: returns blocks whose pages are all free.
-        static void release_empty() noexcept {
-            auto& state = process_state();
-            DataPage* pages;
-            {
-                SpinLockGuard guard(state.empty_pages_lock);
-                pages = state.empty_pages;
-                state.empty_pages = nullptr;
-            }
-            Block* blocks = _remove_empty(pages);
-            pages = merge_sort<&DataPage::next>(pages);
-            _push(pages);
-            _release_empty(blocks);
-        }
+        SGCL_API static void release_empty() noexcept;
 
-        static void free(DataPage* pages, bool destructor = false) noexcept {
-            size_t free_count = 0;
-            for (auto page = pages; page; page = page->next) {
-                ++free_count;
-            }
-            Block* blocks = _remove_empty(pages);
-            _release_empty(blocks);
-            _push(merge_sort<&DataPage::next>(pages));
-            if (free_count && !destructor) {
-                MemoryCounters::update_free(free_count, config::PageSize * free_count);
-                if (free_count * 4 > MemoryCounters::last_alloc_count() + 64) {
-                    force_short_sleep();
-                }
-            }
-        }
+        SGCL_API static void free(DataPage* pages, bool destructor = false) noexcept;
 
     private:
         PointerPool<Block::PageCount, config::PageSize> _pointer_pool;
 
-        static void _push(DataPage* pages) noexcept {
-            if (!pages) {
-                return;
-            }
-            auto last = pages;
-            while(last->next) {
-                last = last->next;
-            }
-            auto& state = process_state();
-            SpinLockGuard guard(state.empty_pages_lock);
-            last->next = state.empty_pages;
-            state.empty_pages = pages;
-        }
+        SGCL_API static void _push(DataPage* pages) noexcept;
 
         // Unlinks the pages of fully free blocks from `pages` and returns those blocks.
-        static Block* _remove_empty(DataPage*& pages) noexcept {
-            Block* blocks = nullptr;
-            for (auto page = pages; page; page = page->next) {
-                Block* block = page->block;
-                if (!block->page_count) {
-                    block->next = blocks;
-                    blocks = block;
-                }
-                ++block->page_count;
-            }
-            DataPage* prev = nullptr;
-            auto page = pages;
-            while(page) {
-                auto next = page->next;
-                Block* b = page->block;
-                assert(b->page_count <= Block::PageCount);
-                if (b->page_count == Block::PageCount) {
-                    if (!prev) {
-                        pages = next;
-                    } else {
-                        prev->next = next;
-                    }
-                } else {
-                    prev = page;
-                }
-                page = next;
-            }
-            return blocks;
-        }
+        SGCL_API static Block* _remove_empty(DataPage*& pages) noexcept;
 
-        static void _release_empty(Block* block) noexcept {
-            or_fatal([&] {
-                std::vector<Block*> blocks_to_delete;
-                while(block) {
-                    auto next = block->next;
-                    if (block->page_count == Block::PageCount) {
-                        blocks_to_delete.push_back(block);
-                    } else {
-                        block->page_count = 0;
-                    }
-                    block = next;
-                }
-                if (blocks_to_delete.size()) {
-                    destroyer_threads().emplace_back([blocks = std::move(blocks_to_delete)] {
-                        for (auto block: blocks) {
-                            delete block;
-                        }
-                    });
-                }
-            });
-        }
+        SGCL_API static void _release_empty(Block* block) noexcept;
     };
 }
