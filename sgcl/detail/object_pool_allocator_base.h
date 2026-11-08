@@ -17,6 +17,10 @@ namespace sgcl::detail {
     public:
         using IsPoolAllocator = std::true_type;
 
+        // Created and destroyed by the owner (sgcl/state_impl.h), so its allocation and deallocation pair up in one
+        // image whichever image first allocated the type on this thread.
+        SGCL_API static ObjectPoolAllocator* create(BlockAllocator& ba, std::atomic<Page*>& pages, Metadata& metadata) noexcept;
+
         SGCL_API ObjectPoolAllocator(BlockAllocator& ba, std::atomic<Page*>& pages, Metadata& metadata) noexcept;
 
         // Collector only.

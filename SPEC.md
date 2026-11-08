@@ -203,13 +203,13 @@ the elements it visits afterwards are unspecified. Iteration order is unspecifie
 
 | Macro | Meaning |
 |---|---|
-| `SGCL_API` | Linkage of the three exported state functions (§4.9): `__declspec(dllexport)` in the owning image and `__declspec(dllimport)` elsewhere on Windows; default visibility on ELF/Mach-O. Required on Windows when the program has more than one image. Default: empty. |
+| `SGCL_API` | Linkage of what the owning image exports (§4.9): the three state functions and the out-of-line allocator and collector code `sgcl/state_impl.h` defines. `__declspec(dllexport)` in the owning image and `__declspec(dllimport)` elsewhere on Windows; default visibility on ELF/Mach-O. Required on Windows when the program has more than one image. Default: empty. |
 | `SGCL_MAX_TYPES_NUMBER` | The number of distinct managed types a process may allocate (default 4096). A decimal literal. Every image **MUST** use the same value; a mismatch fails to link or load. |
 | `SGCL_FINALIZE_HOOK` | The name of the finalize hook member function (default `sgcl_finalize`). Every image **MUST** use the same value. |
 
 `sgcl/state_impl.h` defines the process state. Exactly one translation unit of exactly one image of the process **MUST**
 include it. That image is the *owner*. The owner, and every image that allocated a managed object (its per-type
-destroy, finalize and free functions live in that image, §4.9), **MUST** stay loaded until the process exits.
+destroy and finalize functions live in that image, §4.9), **MUST** stay loaded until the process exits.
 
 ## 4. Design
 
@@ -396,9 +396,11 @@ One `ProcessState` per process (thread registry, free-page stack, type counter, 
 `Collector`, and one `Thread` record per thread, all owned by the image that includes `sgcl/state_impl.h` and reached by
 every image through three exported functions whose names embed `SGCL_MAX_TYPES_NUMBER`. `ProcessState` is
 constant-initialized and trivially destructible, so it is usable before and after static initialization of any image.
-The collector object is immortal. Per-type data (metadata, allocator entry points, child layout) is per image; the
-collector reaches it through each page's header, so images need not merge their template statics. Type indices come
-from the process-wide counter.
+The collector object is immortal. Per-type data (metadata with the type's page buffer, child layout, destroy and
+finalize functions) is per image; the collector reaches it through each page's header, so images need not merge their
+template statics. The code that is not per type -- the pool allocator, its pages, the block allocator, the page
+registry -- is not a template: the owner defines it once (`sgcl/state_impl.h`) and exports it with `SGCL_API`, and a
+type's allocator is created and destroyed there. Type indices come from the process-wide counter.
 
 A thread's record is created on its first use of SGCL and destroyed at thread exit; its pages outlive it. No thread
 exit and no static destructor stops the collector.

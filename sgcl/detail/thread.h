@@ -92,7 +92,7 @@ namespace sgcl::detail {
             auto& alocator = _allocators[_type_index<typename TypeInfo<T>::Type>()];
             if (!alocator) [[unlikely]] {
                 if constexpr(Allocator::IsPoolAllocator::value) {
-                    alocator = checked_new<Allocator>(*_block_allocator, _data->pages, TypeInfo<T>::private_metadata());
+                    alocator = Allocator::create(*_block_allocator, _data->pages, TypeInfo<T>::private_metadata());
                 } else {
                     alocator = checked_new<Allocator>(_data->pages);
                 }

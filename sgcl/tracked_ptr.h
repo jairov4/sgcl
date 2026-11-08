@@ -199,7 +199,7 @@ namespace sgcl {
             }
 
             // Constructs this pointer from `p`, whose referent is `value` as this pointer's element type.
-            void _init_from_move(TrackedPtrBase& p, void* value) noexcept {
+            void _init_from_move(TrackedPtrBase& p, const void* value) noexcept {
                 if (_init_stack_or_child()) {
                     _cell()->store(value);
                 } else if (p._is_external()) {
@@ -217,7 +217,7 @@ namespace sgcl {
                 p._reset();
             }
 
-            void _assign_from_move(TrackedPtrBase& p, void* value) noexcept {
+            void _assign_from_move(TrackedPtrBase& p, const void* value) noexcept {
                 if (this == &p) {
                     return;
                 }

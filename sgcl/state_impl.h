@@ -156,6 +156,11 @@ namespace sgcl::detail {
 
 // Out of line: the slow paths and collector-only code of detail/object_pool_allocator_base.h, compiled once, in this TU.
 namespace sgcl::detail {
+    ObjectPoolAllocator* ObjectPoolAllocator::create(BlockAllocator& ba, std::atomic<Page*>& pages,
+                                                     Metadata& metadata) noexcept {
+        return checked_new<ObjectPoolAllocator>(ba, pages, metadata);
+    }
+
     ObjectPoolAllocator::ObjectPoolAllocator(BlockAllocator& ba, std::atomic<Page*>& pages, Metadata& metadata) noexcept
     : ObjectAllocatorBase(pages)
     , _block_allocator(ba)
